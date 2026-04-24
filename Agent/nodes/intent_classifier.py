@@ -7,6 +7,7 @@ def intent_classifier_node(state: AgentState) -> AgentState:
     """
     节点1: 意图分类
 
+    仅在 waiting_info 为空时执行（首次对话或有完整上下文时）
     输入: user_input
     输出: intents, primary_intent, entities
     """

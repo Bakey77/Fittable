@@ -97,18 +97,26 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     节点3: 训练计划
 
-    输入: user_input, profile, entities
-    输出: plan, status, follow_up_questions
+    输入: user_input, profile, entities, pending_intent, pending_entities, waiting_info
+    输出: plan, status, follow_up_questions, waiting_info, pending_intent, pending_entities
     """
     user_input = state["user_input"]
     profile = state.get("profile", {})
     entities = state.get("entities", {})
+    pending_intent = state.get("pending_intent")
+    pending_entities = state.get("pending_entities")
+    waiting_info = state.get("waiting_info")
 
-    # 合并实体，缺失时用 LLM 补充
-    merged_entities = dict(entities or {})
-    if not merged_entities.get("goal") or not merged_entities.get("frequency"):
-        extracted = _extract_plan_entities_with_llm(user_input)
-        merged_entities = {**extracted, **merged_entities}
+    # 首次进入（不是从 waiting 恢复）
+    if not waiting_info:
+        # 合并实体，缺失时用 LLM 补充
+        merged_entities = dict(entities or {})
+        if not merged_entities.get("goal") or not merged_entities.get("frequency"):
+            extracted = _extract_plan_entities_with_llm(user_input)
+            merged_entities = {**extracted, **merged_entities}
+    else:
+        # 从 waiting 恢复：pending_entities 中的缺失字段已经是 None
+        merged_entities = dict(pending_entities or {})
 
     # 检查必需信息
     info = _check_plan_info(merged_entities, profile)
@@ -123,6 +131,9 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
             "plan": {},
             "status": "need_info",
             "follow_up_questions": questions,
+            "waiting_info": {"missing": info["missing"]},
+            "pending_intent": "training_plan",
+            "pending_entities": merged_entities,
         }
 
     # 生成训练计划
@@ -148,10 +159,16 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
             "plan": {},
             "status": "error",
             "follow_up_questions": [],
+            "waiting_info": None,
+            "pending_intent": None,
+            "pending_entities": None,
         }
 
     return {
         "plan": plan_json,
         "status": "success",
         "follow_up_questions": [],
+        "waiting_info": None,
+        "pending_intent": None,
+        "pending_entities": None,
     }
