@@ -4,22 +4,18 @@ Run from project root:
     python -m Agent "深蹲怎么做"
     python -m Agent "给我一个训练计划" --session my_session
 """
-import sys
-import json
+import argparse
 from .workflow import run_workflow
 
 
 def main() -> None:
-    args = sys.argv[1:]
-    session_id = "default"
+    parser = argparse.ArgumentParser(description="Run Agent workflow from CLI.")
+    parser.add_argument("user_input", nargs="?", help="用户输入问题")
+    parser.add_argument("--session", dest="session_id", default="default", help="会话 ID")
+    parsed = parser.parse_args()
 
-    # 解析参数
-    user_input = None
-    for i, arg in enumerate(args):
-        if arg == "--session" and i + 1 < len(args):
-            session_id = args[i + 1]
-        elif not arg.startswith("--"):
-            user_input = arg
+    user_input = parsed.user_input
+    session_id = parsed.session_id
 
     if not user_input:
         user_input = input("请输入问题: ").strip()
@@ -40,6 +36,10 @@ def main() -> None:
     if result.get("plan"):
         plan = result.get("plan", {})
         print(f"plan: goal={plan.get('goal')}, days={len(plan.get('plan', []))}")
+    if result.get("analysis_result"):
+        print(f"analysis_result: {result.get('analysis_result', '')}")
+    if result.get("general_response"):
+        print(f"general_response: {result.get('general_response', '')}")
 
 
 if __name__ == "__main__":

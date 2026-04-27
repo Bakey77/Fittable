@@ -1,13 +1,18 @@
 """
 Workout Agent LangGraph Workflow
 
-多轮状态机：
-- 首次进入: check_waiting → intent_classifier → guidance/planning → END
-- 追问后恢复: check_waiting → planning → END（外部存储状态，下轮继续）
+主工作流（去掉 check_waiting）：
+- 入口：intent_classifier
+- 路由：按意图类型分发到各节点
+
+子图（planning_node 内部循环）：
+- extract → merge → check → [有缺失?] → [追问用户] → loop
+- 用户回复后，本轮 workflow 重新触发 intent_classifier（带着新 user_input）
+- planning_node 在同一轮次内累积 pending_entities，直到字段齐全才生成计划
 
 短期记忆集成：
-- run_workflow 前读取 session memory，注入 working_memory
-- run_workflow 后写回 user turn + assistant output + working_memory
+- run_workflow 前读取 session memory，注入 pending_entities
+- run_workflow 后写回 user turn + assistant output + pending_entities
 - 每次调用结束执行 trim_and_summarize 控制长度
 """
 from typing import Literal
@@ -27,15 +32,17 @@ if __package__ in (None, ""):
 
     from Agent.nodes.state import AgentState
     from Agent.nodes.intent_classifier import intent_classifier_node
-    from Agent.nodes.check_waiting import check_waiting_node
     from Agent.nodes.guidance import guidance_node
     from Agent.nodes.planning import planning_node
+    from Agent.nodes.general_conversation_node import general_conversation_node
 else:
     from .nodes.state import AgentState
     from .nodes.intent_classifier import intent_classifier_node
-    from .nodes.check_waiting import check_waiting_node
     from .nodes.guidance import guidance_node
     from .nodes.planning import planning_node
+    from .nodes.diet_analysis_node import diet_analysis_node
+    from .nodes.meal_planning_node import meal_planning_node
+    from .nodes.general_conversation_node import general_conversation_node
 
 # 短期记忆模块
 from .memory import (
@@ -48,66 +55,124 @@ from .memory import (
     get_working_memory,
 )
 
-
-def _should_skip_intent_classifier(state: AgentState) -> bool:
-    """判断是否应该跳过 intent_classifier（处于 waiting 恢复状态）"""
-    waiting_info = state.get("waiting_info")
-    if waiting_info and waiting_info.get("missing"):
-        return True
-    return False
+# 长期记忆模块
+from .memory.long_memory import update_if_needed, load_long_memory, render_markdown
 
 
-def _route_by_intent(state: AgentState) -> Literal["guidance_node", "planning_node", "__end__"]:
-    """根据意图路由"""
+def _route_by_intent(state: AgentState) -> Literal["guidance_node", "planning_node", "diet_analysis_node", "meal_planning_node", "general_conversation_node", "__end__"]:
+    """
+    参数:
+    - state: 当前工作流状态
+      来源: intent_classifier 节点输出后的 state
+
+    输出:
+    - "guidance_node" | "planning_node" | "diet_analysis_node" | "meal_planning_node" | "general_conversation_node" | "__end__"
+      由 primary_intent 决定路由分支
+
+    流向:
+    - 作为 intent_classifier 的条件边函数，控制后续节点执行路径
+    """
     primary_intent = state.get("primary_intent")
 
     if primary_intent == "training_guidance":
         return "guidance_node"
     elif primary_intent == "training_plan":
         return "planning_node"
+    elif primary_intent == "diet_analysis":
+        return "diet_analysis_node"
+    elif primary_intent == "meal_planning":
+        return "meal_planning_node"
+    elif primary_intent == "general":
+        return "general_conversation_node"
     else:
         return "__end__"
 
 
+def _route_pending_or_intent(state: AgentState) -> str:
+    """
+    路由决策：
+    - 如果 pending_intent 存在（多轮追问中），直接路由到对应节点，跳过 intent_classifier
+    - 否则，走 intent_classifier → _route_by_intent 的普通路由
+
+    输出:
+    - 目标节点名
+    """
+    pending_intent = state.get("pending_intent")
+    if pending_intent:
+        if pending_intent == "training_plan":
+            return "planning_node"
+        elif pending_intent == "training_guidance":
+            return "guidance_node"
+        elif pending_intent == "diet_analysis":
+            return "diet_analysis_node"
+        elif pending_intent == "meal_planning":
+            return "meal_planning_node"
+        elif pending_intent == "general":
+            return "general_conversation_node"
+
+    # 无 pending_intent，走普通意图分类路由
+    return _route_by_intent(state)
+
+
+def _should_skip_intent_classifier(state: AgentState) -> bool:
+    """如果 pending_intent 存在，跳过 intent_classifier，直接路由到 pending 节点"""
+    return bool(state.get("pending_intent"))
+
+
 def build_workflow():
-    """构建工作流图"""
+    """
+    参数:
+    - 无
+      来源: 由 get_workflow 在首次调用时触发
+
+    输出:
+    - 编译后的 LangGraph workflow 对象
+
+    流向:
+    - 缓存在模块级 _workflow_instance
+    - 被 run_workflow 调用用于 invoke
+    """
     workflow = StateGraph(AgentState)
 
     # 添加所有节点
-    workflow.add_node("check_waiting", check_waiting_node)
     workflow.add_node("intent_classifier", intent_classifier_node)
     workflow.add_node("guidance_node", guidance_node)
     workflow.add_node("planning_node", planning_node)
+    workflow.add_node("diet_analysis_node", diet_analysis_node)
+    workflow.add_node("meal_planning_node", meal_planning_node)
+    workflow.add_node("general_conversation_node", general_conversation_node)
 
-    # 设置入口点
-    workflow.set_entry_point("check_waiting")
+    # 设置入口点：直接进入 intent_classifier
+    workflow.set_entry_point("intent_classifier")
 
-    # check_waiting → 条件边：有 waiting_info 跳过 intent_classifier
-    workflow.add_conditional_edges(
-        "check_waiting",
-        _should_skip_intent_classifier,
-        {
-            True: "planning_node",
-            False: "intent_classifier",
-        }
-    )
-
-    # intent_classifier → 条件边：根据意图路由
+    # intent_classifier → 条件边：先检查 pending_intent，有则跳到对应节点
     workflow.add_conditional_edges(
         "intent_classifier",
-        _route_by_intent,
+        _route_pending_or_intent,
         {
             "guidance_node": "guidance_node",
             "planning_node": "planning_node",
+            "diet_analysis_node": "diet_analysis_node",
+            "meal_planning_node": "meal_planning_node",
+            "general_conversation_node": "general_conversation_node",
             "__end__": END,
         }
     )
+
+    # general_conversation_node → END
+    workflow.add_edge("general_conversation_node", END)
 
     # planning_node → END
     workflow.add_edge("planning_node", END)
 
     # guidance_node → END
     workflow.add_edge("guidance_node", END)
+
+    # diet_analysis_node → END
+    workflow.add_edge("diet_analysis_node", END)
+
+    # meal_planning_node → END
+    workflow.add_edge("meal_planning_node", END)
 
     return workflow.compile()
 
@@ -117,6 +182,17 @@ _workflow_instance = None
 
 
 def get_workflow():
+    """
+    参数:
+    - 无
+      来源: run_workflow 每次调用都会请求
+
+    输出:
+    - workflow 实例（单例）
+
+    流向:
+    - 直接供 run_workflow.invoke 使用
+    """
     global _workflow_instance
     if _workflow_instance is None:
         _workflow_instance = build_workflow()
@@ -134,18 +210,34 @@ def run_workflow(
     """
     运行工作流
 
-    Args:
-        user_input: 用户输入
-        profile: 用户画像（可选）
-        waiting_info: 追问状态（可选，显式传入优先于 memory）
-        pending_intent: 上一轮意图（可选）
-        pending_entities: 上一轮实体（可选）
-        session_id: session 标识（默认 "default"）
+    参数:
+    - user_input: 用户输入文本
+      来源: API/CLI 上层调用方
+    - profile: 用户画像（可选）
+      来源: 调用方传入或用户资料系统
+    - waiting_info: 等待补充信息状态（可选）
+      来源: 上层显式传入；若为 None 则回退到 short-term memory
+    - pending_intent: 待恢复意图（可选）
+      来源: 上层显式传入；若为 None 则回退到 short-term memory
+    - pending_entities: 待恢复实体（可选）
+      来源: 上层显式传入；若为 None 则回退到 short-term memory
+    - session_id: 会话标识
+      来源: 调用方（用于隔离短期记忆）
+
+    输出:
+    - result(dict): workflow 最终状态中的核心业务输出
+      典型字段: status / guidance / plan / follow_up_questions / waiting_info 等
+
+    流向:
+    - 直接返回给上层调用方（接口响应）
+    - 同时 result 的关键字段被写回 session memory，影响同一 session 的下一轮
     """
     workflow = get_workflow()
 
     # -----------------------------------------------------------------
-    # 1. 从短期记忆读取 working_memory（若显式参数未提供则使用）
+    # 1) 输入预处理层：从 memory 读取 working_memory（显式参数优先）
+    #    数据来源: session_memory
+    #    数据去向: initial_state.waiting_info/pending_*
     # -----------------------------------------------------------------
     working_memory = get_working_memory(session_id)
 
@@ -156,9 +248,14 @@ def run_workflow(
     if pending_entities is None:
         pending_entities = working_memory.get("pending_entities")
 
-    # 读取 memory summary 和 recent_turns（用于上下文）
+    # 2) 读取上下文短期记忆
+    #    数据来源: session_memory(memory_summary/recent_turns)
+    #    数据去向: initial_state.memory_summary/recent_turns
     memory_summary = get_memory_summary(session_id)
     recent_turns = get_recent_turns(session_id)
+
+    # 读取长期记忆（markdown 格式，用于注入 prompt）
+    long_memory_md = render_markdown(load_long_memory(session_id))
 
     initial_state: AgentState = {
         "user_input": user_input,
@@ -172,6 +269,7 @@ def run_workflow(
         "session_id": session_id,
         "memory_summary": memory_summary or None,
         "recent_turns": recent_turns or [],
+        "long_memory": long_memory_md,
         "retrieved_content": "",
         "guidance": "",
         "plan": {},
@@ -181,38 +279,110 @@ def run_workflow(
         "metadata": {},
     }
 
+    # 3) 执行工作流
+    #    输入: initial_state
+    #    输出: result
     result = workflow.invoke(initial_state)
 
     # -----------------------------------------------------------------
-    # 2. 写回短期记忆
+    # 4) 结果写回层：写回短期记忆
+    #    数据来源: user_input + result
+    #    数据去向: session_memory(recent_turns/working_memory)
     # -----------------------------------------------------------------
     # 追加用户输入
     append_turn(session_id, "user", user_input)
+
+    # 累计 total_turns（用于长期记忆触发判断）
+    _increment_total_turns(session_id)
 
     # 追加助手输出摘要
     if result.get("guidance"):
         output_summary = result["guidance"][:100] + "..." if len(result["guidance"]) > 100 else result["guidance"]
         append_turn(session_id, "assistant", f"[guidance] {output_summary}")
+        _increment_total_turns(session_id)
     elif result.get("plan"):
         plan_summary = f"[plan] {result['plan'].get('goal', '')} - {len(result['plan'].get('plan', []))} days"
         append_turn(session_id, "assistant", plan_summary)
+        _increment_total_turns(session_id)
+    elif result.get("analysis_result"):
+        output_summary = result["analysis_result"][:100] + "..." if len(result["analysis_result"]) > 100 else result["analysis_result"]
+        append_turn(session_id, "assistant", f"[diet_analysis] {output_summary}")
+        _increment_total_turns(session_id)
     elif result.get("follow_up_questions"):
         append_turn(session_id, "assistant", f"[follow_up] {'; '.join(result['follow_up_questions'])}")
+        _increment_total_turns(session_id)
 
     # 更新 working_memory
+    # 规则：只有当节点显式返回非 None 值时才覆盖 working_memory
+    # None 值表示"不更新"，保留旧值
+    next_waiting_info = result.get("waiting_info")
+    next_pending_intent = result.get("pending_intent")
+    next_pending_entities = result.get("pending_entities")
+
+    if next_waiting_info is None and "waiting_info" not in result:
+        next_waiting_info = working_memory.get("waiting_info")
+    if next_pending_intent is None and "pending_intent" not in result:
+        next_pending_intent = working_memory.get("pending_intent")
+    if next_pending_entities is None and "pending_entities" not in result:
+        next_pending_entities = working_memory.get("pending_entities")
+
     update_working_memory(
         session_id,
-        waiting_info=result.get("waiting_info"),
-        pending_intent=result.get("pending_intent"),
-        pending_entities=result.get("pending_entities"),
+        waiting_info=next_waiting_info,
+        pending_intent=next_pending_intent,
+        pending_entities=next_pending_entities,
     )
 
     # -----------------------------------------------------------------
-    # 3. 裁剪长度
+    # 5) 记忆维护层：裁剪长度
+    #    数据来源: session_memory.recent_turns
+    #    数据去向: session_memory.memory_summary + 新 recent_turns
     # -----------------------------------------------------------------
-    trim_and_summarize(session_id, max_turns=10)
+    try:
+        trim_and_summarize(session_id, max_turns=10)
+    except RuntimeError as e:
+        # 压缩失败，在 result 中标记，提示用户重试
+        from .memory.session_memory import check_compress_status
+        compress_status = check_compress_status(session_id)
+        result["compress_retry_needed"] = compress_status["needs_retry"]
+        if compress_status["needs_retry"]:
+            result["compress_backup_info"] = compress_status["backup_info"]
+            result["_compress_error"] = str(e)
+
+    # -----------------------------------------------------------------
+    # 6) 长期记忆更新层（每10轮触发一次）
+    #    数据来源: session_memory.recent_turns + result.entities/intent
+    #    数据去向: Agent/memory/long_term_store/{session_id}.md
+    # -----------------------------------------------------------------
+    recent_turns = get_recent_turns(session_id)
+    latest_entities = result.get("entities") or result.get("pending_entities")
+    latest_intent = result.get("primary_intent")
+
+    lm_result = update_if_needed(session_id, recent_turns, latest_entities, latest_intent)
+    if lm_result.get("triggered"):
+        if lm_result.get("conflicts"):
+            result["conflicts"] = lm_result["conflicts"]
+            result["conflict_notice"] = lm_result.get("conflict_notice")
+        if lm_result.get("warning"):
+            if "metadata" not in result:
+                result["metadata"] = {}
+            result["metadata"]["long_memory_warning"] = lm_result["warning"]
 
     return result
+
+
+def _increment_total_turns(session_id: str) -> None:
+    """
+    递增 session memory 中的 total_turns 计数器。
+    该计数器用于长期记忆触发判断，不受 trim_and_summarize 影响。
+    """
+    from .memory import session_memory
+
+    full = session_memory.get_session_memory(session_id)
+    if "metadata" not in full:
+        full["metadata"] = {}
+    full["metadata"]["total_turns"] = full["metadata"].get("total_turns", 0) + 1
+    session_memory._save_memory(session_id, full)
 
 
 if __name__ == "__main__":
