@@ -102,8 +102,16 @@ class FoodDataSearcher:
         Returns:
             格式化后的食物营养信息列表
         """
+        # ---- 查缓存 ----
+        from Agent.cache import get_food_cache
+        cache = get_food_cache()
+        cached = cache.get(query)
+        if cached is not None:
+            return cached
+
         items = self._load_food_data()
         if not items:
+            cache.set(query, [])
             return []
 
         # 预处理 query：提取食物名称（去掉"多少卡"、"热量"等后缀）
@@ -130,6 +138,8 @@ class FoodDataSearcher:
                     results.append(self._format_food_item(item))
                     seen_ids.add(item.get("food_name"))
 
+        # ---- 写缓存 ----
+        cache.set(query, results)
         return results
 
 
@@ -139,14 +149,14 @@ class FoodDataSearcher:
 def _tavily_search_diet(
     query: str,
     long_memory: str | None = None,
-    memory_summary: str | None = None,
+    recent_turns: list | None = None,
 ) -> str | None:
     """使用 Tavily 搜索食物营养信息
 
     Args:
         query: 用户查询
         long_memory: 长期记忆 markdown
-        memory_summary: 短期记忆历史摘要
+        recent_turns: 短期记忆
 
     Returns:
         格式化后的营养信息字符串，失败返回 None
@@ -157,14 +167,17 @@ def _tavily_search_diet(
             return None
 
         # 构建提示让 LLM 提取营养信息并格式化为统一格式
-        from backend.services.llm import get_llm
+        from backend.services.llm import get_longcat_llm
 
         mem_parts = []
         if long_memory:
-            mem_parts.append(f"用户长期记忆：\n{long_memory}")
-        if memory_summary:
-            mem_parts.append(f"对话历史摘要：\n{memory_summary}")
-        mem_section = "\n".join(mem_parts)
+            mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+        if recent_turns:
+            mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
+                f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
+                for t in recent_turns
+            ))
+        mem_section = "\n\n".join(mem_parts)
         mem_block = f"\n{mem_section}\n" if mem_section else "\n"
 
         prompt = f"""你是营养分析助手。请结合以下用户记忆上下文，从搜索结果中提取食物营养信息。{mem_block}
@@ -183,7 +196,7 @@ def _tavily_search_diet(
 搜索结果：
 {text}
 """
-        llm = get_llm()
+        llm = get_longcat_llm()
         response = llm.invoke([{"role": "user", "content": prompt}])
         result = response.content if hasattr(response, "content") else str(response)
         return result.strip() if result else None
@@ -201,9 +214,7 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
       关键读取字段:
       1) user_input: 用户输入文本
       2) long_memory: 长期记忆 markdown
-      3) memory_summary: 短期记忆历史摘要
-
-    输出:
+          输出:
     - analysis_result: 饮食营养分析结果
     - status: success | not_found
     - metadata: 检索来源信息（source/hit_ids）
@@ -213,7 +224,7 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     user_input = state["user_input"]
     long_memory = state.get("long_memory")
-    memory_summary = state.get("memory_summary")
+    recent_turns = state.get("recent_turns")
 
     # 初始化食物检索器
     searcher = FoodDataSearcher.get_instance()
@@ -234,7 +245,7 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # 3. food_data 未命中，fallback 到 tavily（注入记忆上下文）
-    tavily_result = _tavily_search_diet(user_input, long_memory, memory_summary)
+    tavily_result = _tavily_search_diet(user_input, long_memory, recent_turns)
     if tavily_result and tavily_result != "未找到相关营养数据":
         return {
             "analysis_result": tavily_result,

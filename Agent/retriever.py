@@ -23,7 +23,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from backend.services.llm import get_embedding_model, get_llm
+from backend.services.llm import get_embedding_model, get_longcat_llm
 from config import Config
 
 # Qdrant 配置
@@ -103,7 +103,7 @@ class QueryRewriter:
     @property
     def llm(self):
         if self._llm is None:
-            self._llm = get_llm()
+            self._llm = get_longcat_llm()
         return self._llm
 
     def rewrite(self, query: str) -> str:
@@ -313,7 +313,15 @@ class FitnessGuideRetrieverImpl:
         self._vector = VectorRetriever(self.collection_name, self.client, self.embed_model)
         self._bm25 = BM25Retriever(self.collection_name, self.client)
 
-    def retrieve(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 3, use_cache: bool = True) -> list[dict[str, Any]]:
+        #查缓存
+        if use_cache:
+            from Agent.cache import get_retrieval_cache
+            cache = get_retrieval_cache()
+            cached = cache.get(query)
+            if cached is not None:
+                return cached
+            
         if self.retrieval_mode == "vector":
             chunks = self._vector.retrieve(query, top_k=top_k)
         elif self.retrieval_mode == "bm25":
@@ -322,7 +330,7 @@ class FitnessGuideRetrieverImpl:
             self._hybrid.fusion_top_k = top_k
             chunks = self._hybrid.retrieve(query)
 
-        return [
+        result = [
             {
                 "id": c.id,
                 "text": c.text,
@@ -331,6 +339,11 @@ class FitnessGuideRetrieverImpl:
             }
             for c in chunks
         ]
+        #写缓存
+        if use_cache:
+            cache.set(query,result,is_empty=(len(result)==0))
+        return result
+                
 
     def retrieve_with_scores(self, query: str) -> dict[str, Any]:
         if self.retrieval_mode != "hybrid":

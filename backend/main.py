@@ -22,13 +22,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from Agent.cache import get_retrieval_cache, get_food_cache
+
 from Agent.workflow import run_workflow
 from Agent.memory.session_memory import (
     check_compress_status,
     retry_compress,
     discard_compress_backup,
     clear_session_memory,
+    generate_and_store_session_token,
+    validate_session_token,
+    has_session_token,
 )
+
+import threading
+
+from Agent.memory.metrics import record_redis_op, get_global_stats
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +46,18 @@ app = FastAPI(title="Fit-Agent API")
 # CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from config import Config  # 导入配置类
+
+_executor = ThreadPoolExecutor(max_workers=Config.THREAD_POOL_MAX_WORKERS,
+                               thread_name_prefix="fit_agent_worker",)  # 全局线程池实例
+_task_completed = 0
+_task_lock = threading.Lock()  # 保护 _task_completed 的锁
 
 
 # ---------------------------------------------------------------------------
@@ -177,67 +193,96 @@ def _sanitize_plan_to_chinese(plan: dict) -> dict:
     return plan_copy
 
 
-# CORS 中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # ---------------------------------------------------------------------------
 # Schema 定义
 # ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None
 
 
 class CompressActionRequest(BaseModel):
-    session_id: str
+    pass
 
 
 class ClearSessionRequest(BaseModel):
-    session_id: str
+    pass
 
 
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-def get_or_create_session_id(
-    cookie_session_id: Optional[str],
-    response: Response,
-    explicit_session_id: Optional[str] = None,
-) -> str:
-    """
-    从 Cookie 获取 session_id，若不存在则自动生成并设置 Cookie
+_COOKIE_KWARGS = dict(
+    max_age=30 * 24 * 60 * 60,
+    httponly=True,
+    samesite="none",
+    secure=True,
+)
 
-    参数:
-    - session_id: 从 Cookie 获取的 session_id（可能为 None）
-    - response: FastAPI Response 对象，用于设置 Cookie
+
+def _make_session_cookies(session_id: str, token: str | None = None) -> list[dict]:
+    """返回需要设置的 Cookie 列表，每个元素是 {key, value, kwargs}。
+
+    由调用方在最终返回的 Response 对象上调用 set_cookie。
+    这样 StreamingResponse 和普通 Response 都能正确处理。
+    """
+    cookies = [{"key": "session_id", "value": session_id, "kwargs": _COOKIE_KWARGS}]
+    if token:
+        cookies.append({"key": "session_token", "value": token, "kwargs": _COOKIE_KWARGS})
+    return cookies
+
+
+def _apply_cookies(resp, cookies: list[dict]) -> None:
+    """在任意 Response 对象上设置 Cookie。"""
+    for c in cookies:
+        resp.set_cookie(key=c["key"], value=c["value"], **c["kwargs"])
+
+
+def resolve_session(
+    cookie_session_id: Optional[str],
+    cookie_session_token: Optional[str],
+) -> tuple[str, list[dict]]:
+    """
+    解析并校验会话（所有鉴权端点统一调用）。
 
     返回:
-    - 有效的 session_id
-    """
-    # 优先使用请求体传入的 session_id，其次使用 Cookie，最后自动生成
-    session_id = explicit_session_id or cookie_session_id
-    if not session_id:
-        session_id = str(uuid.uuid4())
+    - (session_id, cookies_to_set)
+      cookies_to_set 需由调用方在最终 Response 对象上 apply。
 
-    # 如果 Cookie 中没有或与当前 sid 不一致，刷新 Cookie
-    if cookie_session_id != session_id:
-        response.set_cookie(
-            key="session_id",
-            value=session_id,
-            max_age=30 * 24 * 60 * 60,  # 30天
-            httponly=True,
-            samesite="lax",
+    抛出:
+    - HTTPException(401): 会话过期
+    - HTTPException(403): token 缺失或不匹配
+    """
+    is_new = False
+    if cookie_session_id:
+        session_id = cookie_session_id
+    else:
+        session_id = str(uuid.uuid4())
+        is_new = True
+
+    # 新会话：生成 token 后直接放行
+    if is_new:
+        token = generate_and_store_session_token(session_id)
+        return session_id, _make_session_cookies(session_id, token)
+
+    # 已有会话：检查是否已初始化 token
+    if not has_session_token(session_id):
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired (no token). Please create a new session.",
         )
-    return session_id
+
+    # 校验 token
+    if not cookie_session_token:
+        raise HTTPException(status_code=403, detail="Missing session token")
+
+    try:
+        validate_session_token(session_id, cookie_session_token)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid session token")
+
+    return session_id, []
 
 
 # ---------------------------------------------------------------------------
@@ -247,24 +292,49 @@ def get_or_create_session_id(
 @app.get("/health")
 def health():
     """健康检查"""
-    return {"status": "ok"}
+    global _task_completed
+    stats = get_global_stats()
+
+    return {"status": "ok",
+            "thread_pool":{
+                "active_threads": len(_executor._threads),
+                "queue_size": _executor._work_queue.qsize(),
+                "max_workers": _executor._max_workers,
+                "tasks_completed": _task_completed,
+            },
+            "redis_metrics": stats,
+            "cache_stats": get_retrieval_cache().get_stats(),
+            "food_cache_stats": get_food_cache().get_stats(),
+        }
 
 
 @app.post("/chat")
-def chat(req: ChatRequest, response: Response, session_id: Optional[str] = Cookie(default=None)):
+async def chat(
+    req: ChatRequest,
+    response: Response,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     聊天接口
 
-    - 自动管理 session_id（Cookie）
+    - 自动管理 session_id / session_token（Cookie）
+    - session_token 服务端校验（防越权）
     - 调用 workflow 执行
     - 返回压缩重试状态（若有）
     """
-    sid = get_or_create_session_id(session_id, response, explicit_session_id=req.session_id)
+    sid, cookies = resolve_session(session_id, session_token)
+    _apply_cookies(response, cookies)
 
+    loop = asyncio.get_event_loop()
     try:
-        result = run_workflow(req.message, session_id=sid)
+        result = await loop.run_in_executor(_executor, run_workflow, req.message, sid)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    global _task_completed
+    with _task_lock:
+        _task_completed += 1
 
     # 构建响应
     resp = {
@@ -300,21 +370,31 @@ def chat(req: ChatRequest, response: Response, session_id: Optional[str] = Cooki
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, response: Response, session_id: Optional[str] = Cookie(default=None)):
+async def chat_stream(
+    req: ChatRequest,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     SSE 流式聊天接口
 
-    - 自动管理 session_id（Cookie）
+    - 自动管理 session_id / session_token（Cookie）
+    - session_token 服务端校验（防越权）
     - 调用 workflow 执行
     - 以 SSE 形式流式返回 intent 和文本内容
     """
-    sid = get_or_create_session_id(session_id, response, explicit_session_id=req.session_id)
+    sid, cookies = resolve_session(session_id, session_token)
 
     def run_sync_workflow():
         return run_workflow(req.message, session_id=sid)
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(ThreadPoolExecutor(), run_sync_workflow)
+    # result = await loop.run_in_executor(ThreadPoolExecutor(), run_sync_workflow) #把workflow丢给一个单独的线程去执行
+
+    result = await loop.run_in_executor(_executor, run_sync_workflow)  # 使用全局线程池
+    global _tasks_completed
+    with _task_lock:
+        _task_completed += 1
 
     primary_intent = result.get("primary_intent") or ""
 
@@ -327,37 +407,22 @@ async def chat_stream(req: ChatRequest, response: Response, session_id: Optional
         plan = _sanitize_plan_to_chinese(result["plan"])
 
         goal_labels = {"muscle_gain": "增肌", "fat_loss": "减脂", "beginner": "新手入门"}
-        focus_labels = {
-            "push": "推", "pull": "拉", "legs": "腿", "full_body": "全身", "core": "核心", "cardio": "有氧",
-            "Push": "推", "Pull": "拉", "Legs": "腿", "Full_Body": "全身", "Core": "核心", "Cardio": "有氧",
-        }
-
         goal_text = goal_labels.get(plan.get('goal', ''), plan.get('goal', ''))
         frequency = plan.get('frequency', 0)
 
-        # 按 focus 分组
-        focus_groups = {}
-        for day in plan.get("plan", []):
-            focus = day.get('focus', 'unknown')
-            focus_zh = focus_labels.get(focus, focus)
-            if focus_zh not in focus_groups:
-                focus_groups[focus_zh] = []
-            focus_groups[focus_zh].append(day)
-
-        # 生成文本
+        # 按 day 顺序逐天输出，不按 focus 分组合并
         lines = [f"训练计划：{goal_text}"]
-        lines.append(f"每周训练：{frequency}天 | 训练频率：{', '.join(focus_groups.keys())}")
+        lines.append(f"每周训练：{frequency}天")
         lines.append("")
 
-        for focus_zh, days in focus_groups.items():
-            lines.append(f"【{focus_zh}训练日】")
-            for day in days:
-                # day 已在归一化时转换为中文
-                lines.append(f"  {day.get('day')}")
-                for ex in day.get('exercises', []):
-                    # exercise name 已在归一化时转换为中文
-                    ex_name = ex.get('name', '')
-                    lines.append(f"    - {ex_name}: {ex.get('sets')}组 × {ex.get('reps')}次")
+        for day in plan.get("plan", []):
+            # day/focus 已在归一化时转换为中文
+            day_label = day.get('day', '')
+            focus = day.get('focus', '')
+            lines.append(f"{day_label}（{focus}）")
+            for ex in day.get('exercises', []):
+                ex_name = ex.get('name', '')
+                lines.append(f"  - {ex_name}: {ex.get('sets')}组 × {ex.get('reps')}次")
             lines.append("")
 
         text = "\n".join(lines).strip()
@@ -391,35 +456,46 @@ async def chat_stream(req: ChatRequest, response: Response, session_id: Optional
             logger.warning(f"[planning] 二次处理后文本: {text[:100]}")
 
     async def event_stream() -> AsyncIterator[str]:
-        # 先发送 session_id
+        # Stage 1: 立即返回 session_id
         yield f"data: {json.dumps({'session_id': sid})}\n\n"
 
-        # 发送 intent 标识
+        # Stage 2: 立即返回状态事件
+        yield f"data: {json.dumps({'stage': 'processing'})}\n\n"
+
+        # Stage 3: 发送 intent（拿到分类结果后）
         yield f"data: {json.dumps({'intent': primary_intent})}\n\n"
 
-        # 逐字符 yield 文本内容
-        for ch in text:
-            yield f"data: {ch}\n\n"
+        # Stage 4: 正文按行 chunk 流出
+        CHUNK_SIZE = 60  # 约60字符/块，兼顾实时性与网络效率
+        for i in range(0, len(text), CHUNK_SIZE):
+            chunk = text[i:i+CHUNK_SIZE]
+            yield f"data: {json.dumps({'text': chunk})}\n\n"
             await asyncio.sleep(0)  # 让出控制权，允许其他协程执行
 
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    streaming_resp = StreamingResponse(event_stream(), media_type="text/event-stream")
+    _apply_cookies(streaming_resp, cookies)
+    return streaming_resp
 
 
 @app.post("/compress-retry")
-def compress_retry(req: CompressActionRequest, response: Response):
+def compress_retry(
+    req: CompressActionRequest,
+    response: Response,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     重试 LLM 压缩
 
-    - 读取备份的 older_turns
-    - 调用 LLM 重新压缩
-    - 成功则更新 memory_summary，清除备份
-    - 失败则保留备份，抛出异常
+    - session_id / session_token 从 Cookie 读取
+    - 读取备份的 older_turns，调用 LLM 重新压缩
+    - 成功则清除备份，失败则保留备份并抛出异常
     """
-    sid = req.session_id
+    sid, cookies = resolve_session(session_id, session_token)
+    _apply_cookies(response, cookies)
 
-    # 检查是否有备份
     status = check_compress_status(sid)
     if not status["needs_retry"]:
         raise HTTPException(status_code=400, detail="No compress backup found, nothing to retry")
@@ -439,15 +515,20 @@ def compress_retry(req: CompressActionRequest, response: Response):
 
 
 @app.post("/compress-discard")
-def compress_discard(req: CompressActionRequest):
+def compress_discard(
+    req: CompressActionRequest,
+    response: Response,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     丢弃压缩备份
 
-    - 清除 older_turns 备份
-    - 清除 compress_failed 标记
-    - 注意：这意味着那些旧对话将不会被压缩，可能丢失上下文
+    - session_id / session_token 从 Cookie 读取
+    - 清除 older_turns 备份和 compress_failed 标记
     """
-    sid = req.session_id
+    sid, cookies = resolve_session(session_id, session_token)
+    _apply_cookies(response, cookies)
 
     discard_compress_backup(sid)
 
@@ -459,15 +540,20 @@ def compress_discard(req: CompressActionRequest):
 
 
 @app.post("/clear-session")
-def clear_session(req: ClearSessionRequest):
+def clear_session(
+    req: ClearSessionRequest,
+    response: Response,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     清除指定 session 的所有记忆
 
-    - 清除主记忆数据
-    - 清除压缩备份
-    - 清除压缩失败标记
+    - session_id / session_token 从 Cookie 读取
+    - 清除主记忆数据、压缩备份、压缩失败标记
     """
-    sid = req.session_id
+    sid, cookies = resolve_session(session_id, session_token)
+    _apply_cookies(response, cookies)
 
     clear_session_memory(sid)
 
@@ -479,17 +565,22 @@ def clear_session(req: ClearSessionRequest):
 
 
 @app.get("/compress-status")
-def compress_status(session_id: str):
+def compress_status(
+    response: Response,
+    session_id: Optional[str] = Cookie(default=None),
+    session_token: Optional[str] = Cookie(default=None),
+):
     """
     查询压缩状态（用于前端检查是否需要提示用户）
 
-    返回:
-    - needs_retry: bool
-    - backup_info: dict | None
+    - session_id / session_token 从 Cookie 读取
     """
-    status = check_compress_status(session_id)
+    sid, cookies = resolve_session(session_id, session_token)
+    _apply_cookies(response, cookies)
+
+    status = check_compress_status(sid)
     return {
-        "session_id": session_id,
+        "session_id": sid,
         **status,
     }
 
