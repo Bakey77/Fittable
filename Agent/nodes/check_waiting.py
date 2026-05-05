@@ -5,13 +5,27 @@ from .state import AgentState
 
 def check_waiting_node(state: AgentState) -> AgentState:
     """
-    节点0: 检查等待状态
+    参数:
+    - state: 当前工作流状态
+      来源: workflow entry 初始状态，或上游节点传递
+      关键读取字段:
+      1) waiting_info
+      2) pending_intent
+      3) pending_entities
 
-    如果 waiting_info 有值（上一轮追问了用户），说明需要跳过意图分类，
-    直接用 pending_intent 和 pending_entities 继续处理
+    输出:
+    - AgentState 增量字段（两种情况）
+      1) waiting 恢复场景:
+         primary_intent: 从 pending_intent 恢复
+         entities: 从 pending_entities + missing 字段补 None 合并
+         waiting_info: 置空（避免重复跳过）
+      2) 非 waiting 场景:
+         返回 {}（不改写 state）
 
-    输入: waiting_info, pending_intent, pending_entities
-    输出: primary_intent, entities, (清空 waiting_info)
+    流向:
+    - 输出进入 workflow 条件路由 `_should_skip_intent_classifier`
+    - 若恢复成功，通常会直接进入 planning_node
+    - 若非恢复，进入 intent_classifier_node
     """
     waiting_info = state.get("waiting_info")
 

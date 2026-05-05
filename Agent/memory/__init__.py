@@ -4,10 +4,13 @@ from .session_memory import (
     append_turn,
     update_working_memory,
     trim_and_summarize,
+    update_metadata,
     clear_session_memory,
     get_recent_turns,
-    get_memory_summary,
     get_working_memory,
+    generate_and_store_session_token,
+    validate_session_token,
+    has_session_token,
 )
 
 from .long_memory import (
@@ -24,10 +27,13 @@ __all__ = [
     "append_turn",
     "update_working_memory",
     "trim_and_summarize",
+    "update_metadata",
     "clear_session_memory",
     "get_recent_turns",
-    "get_memory_summary",
     "get_working_memory",
+    "generate_and_store_session_token",
+    "validate_session_token",
+    "has_session_token",
     # long_memory
     "load_long_memory",
     "save_long_memory",

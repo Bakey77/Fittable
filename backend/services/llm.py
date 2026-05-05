@@ -24,11 +24,18 @@ def get_llm():
         api_key=Config.LLM_API_KEY,
         base_url=Config.LLM_BASE_URL,
         model=Config.LLM_MODEL,
-    )  
-# respond = get_llm().invoke(
-#     [{"role": "user", "content": "你好"}] 
-# )
-# print(respond.content)
+    )
+
+
+def get_longcat_llm():
+    """Longcat Chat LLM（前端对话用）"""
+    return ChatOpenAI(
+        api_key=Config.LONGCAT_API_KEY,
+        base_url=Config.LONGCAT_BASE_URL,
+        model=Config.LONGCAT_MODEL,
+    )
+
+
 def get_embedding_model():
     global _embedding_model_instance
     if DashScopeEmbedding is None:

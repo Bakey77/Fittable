@@ -8,7 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from backend.services.llm import get_llm
+from backend.services.llm import get_longcat_llm
 from tools.search_with_tavily import search_with_tavily
 from ..retriever import get_fitness_guide_retriever
 
@@ -25,7 +25,7 @@ def _call_llm(prompt: str) -> str:
     流向:
     - 返回给 _format_guidance_with_llm 作为动作指导答案
     """
-    llm = get_llm()
+    llm = get_longcat_llm()
     response = llm.invoke([{"role": "user", "content": prompt}])
     return response.content if hasattr(response, "content") else str(response)
 
@@ -47,24 +47,28 @@ def _is_retrieval_sufficient(retrieved_content: str, min_length: int = 40) -> bo
     return bool(retrieved_content and len(retrieved_content.strip()) >= min_length)
 
 
-def _format_guidance_with_llm(query: str, raw_text: str, long_memory: str | None = None) -> str:
+def _format_guidance_with_llm(query: str, raw_text: str, long_memory: str | None = None, recent_turns: list | None = None) -> str:
     """
     参数:
     - query: 用户原始问题
-      来源: guidance_node 的 state["user_input"]
     - raw_text: 最终检索文本（知识库 ± Tavily）
-      来源: guidance_node 检索与兜底拼接结果
     - long_memory: 长期记忆 markdown（可选）
-      来源: state["long_memory"]
+    - recent_turns: 短期记忆（可选）
 
     输出:
     - guidance 文本答案
-
-    流向:
-    - 返回给 guidance_node，写入节点输出 guidance 字段
     """
-    mem_section = f"\n用户长期记忆：\n{long_memory}\n" if long_memory else ""
-    prompt = f"""你是健身教练，请基于检索到的资料回答用户问题。{mem_section}
+    mem_parts = []
+    if long_memory:
+        mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+    if recent_turns:
+        mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
+            f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
+            for t in recent_turns
+        ))
+    mem_section = "\n\n".join(mem_parts)
+    mem_block = f"\n{mem_section}\n" if mem_section else ""
+    prompt = f"""你是健身教练，请基于检索到的资料和用户记忆上下文回答用户问题。{mem_block}
 用户问题：
 {query}
 
@@ -74,7 +78,7 @@ def _format_guidance_with_llm(query: str, raw_text: str, long_memory: str | None
 输出要求：
 1. 分三段：标准动作 / 常见错误 / 注意事项
 2. 每段 2-4 条，简洁可执行
-3. 只基于提供的资料，不要编造
+3. 只基于提供的资料和记忆，不要编造
 4. 不要输出 JSON
 """
     return _call_llm(prompt).strip()
@@ -120,6 +124,7 @@ def guidance_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     user_input = state["user_input"]
     long_memory = state.get("long_memory")
+    recent_turns = state.get("recent_turns")
 
     # 初始化检索器（单例）
     retriever = get_fitness_guide_retriever(retrieval_mode="vector")
@@ -158,7 +163,7 @@ def guidance_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # 生成回答
-    answer = _format_guidance_with_llm(user_input, retrieved_content, long_memory)
+    answer = _format_guidance_with_llm(user_input, retrieved_content, long_memory, recent_turns)
 
     if retrieved_results:
         hit_id = retrieved_results[0].get("id")

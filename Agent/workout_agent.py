@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from backend.services.llm import get_llm
+from backend.services.llm import get_longcat_llm
 from tools.search_with_tavily import search_with_tavily
 
 try:
@@ -113,7 +113,7 @@ def check_plan_info(entities: dict[str, Any], profile: dict[str, Any]) -> dict[s
 
 
 def _call_llm(prompt: str) -> str:
-    llm = get_llm()
+    llm = get_longcat_llm()
     response = llm.invoke([{"role": "user", "content": prompt}])
     return response.content if hasattr(response, "content") else str(response)
 

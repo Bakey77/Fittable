@@ -17,7 +17,7 @@ from qdrant_client.models import ScrollResult, ScoredPoint
 from rank_bm25 import BM25Okapi
 import jieba
 
-from config import AgentConfig
+from config import Config
 
 
 # Query 改写提示词
@@ -243,8 +243,8 @@ class QueryRewriter:
     @property
     def llm(self):
         if self._llm is None:
-            from agent.llm import get_llm
-            self._llm = get_llm()
+            from backend.services.llm import get_longcat_llm
+            self._llm = get_longcat_llm()
         return self._llm
 
     def rewrite(self, query: str) -> str:
@@ -367,10 +367,108 @@ class HybridRetriever:
         }
 
 
+# LLM Rerank 提示词
+RERANK_PROMPT = """你是一个专业的健身知识检索相关性评估器。
+给定一个用户问题和一个知识库片段，你需要评估这个片段对回答用户问题的相关程度。
+
+评分标准：
+- 1.0：该片段直接、完整地回答了用户问题，包含关键细节
+- 0.7：该片段与用户问题高度相关，包含部分答案
+- 0.4：该片段与用户问题有一定关联，但不够精确
+- 0.1：该片段与用户问题关联较弱
+- 0.0：该片段与用户问题完全不相关
+
+用户问题：{query}
+
+知识库片段：
+---
+{chunk_text}
+---
+
+请只输出一个 0 到 1 之间的小数分数，不要输出其他内容。
+分数："""
+
+
+class LLMReranker:
+    """
+    LLM 重排序器
+
+    流程：Hybrid 召回 top_n 候选 → LLM 逐条评估相关性 → 按 LLM 分数重排 → 返回 top_k
+    """
+
+    def __init__(self, rerank_top_n: int = 20):
+        """
+        Args:
+            rerank_top_n: 最多送入 LLM 重排序的候选数量（控制 LLM 调用次数和耗时）
+        """
+        self.rerank_top_n = rerank_top_n
+        self._llm = None
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            from backend.services.llm import get_longcat_llm
+            self._llm = get_longcat_llm()
+        return self._llm
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[RetrievedChunk],
+        top_k: int = 5
+    ) -> list[RetrievedChunk]:
+        """
+        对候选 chunks 进行 LLM 重排序
+
+        Args:
+            query: 用户查询
+            candidates: Hybrid 检索召回的候选 chunks（按 RRF 分数排序）
+            top_k: 最终返回的数量
+
+        Returns:
+            按 LLM 相关性分数重排序后的 chunks
+        """
+        if not candidates:
+            return []
+
+        # 截断到 rerank_top_n 个候选
+        candidates = candidates[:self.rerank_top_n]
+
+        scored = []
+        for chunk in candidates:
+            try:
+                prompt = RERANK_PROMPT.format(
+                    query=query,
+                    chunk_text=chunk.text[:1500]  # 截断避免 token 过长
+                )
+                response = self.llm.invoke([{"role": "user", "content": prompt}])
+                raw_score = response.content.strip() if hasattr(response, "content") else str(response)
+
+                # 解析分数：提取第一个合法浮点数
+                import re
+                match = re.search(r"0?\.\d+|1\.0+|0", raw_score)
+                llm_score = float(match.group(0)) if match else 0.0
+                llm_score = max(0.0, min(1.0, llm_score))  # clamp 到 [0, 1]
+
+            except Exception as e:
+                print(f"[LLMReranker] Chunk scoring failed: {e}, score=0.0")
+                llm_score = 0.0
+
+            scored.append((llm_score, chunk))
+
+        # 按 LLM 分数降序排列
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        reranked = [chunk for _, chunk in scored]
+        print(f"[LLMReranker] query='{query}' | scored {len(candidates)} candidates, top score={scored[0][0] if scored else 0}")
+
+        return reranked[:top_k]
+
+
 def get_hybrid_retriever(collection_name: str) -> HybridRetriever:
     """创建混合检索器"""
     from qdrant_client import QdrantClient
-    from agent.llm import get_embedding_model
-    qdrant_client = QdrantClient(host=AgentConfig.QDRANT_HOST, port=AgentConfig.QDRANT_PORT)
+    from backend.services.llm import get_embedding_model
+    qdrant_client = QdrantClient(host=Config.QDRANT_HOST, port=Config.QDRANT_PORT)
     embed_model = get_embedding_model()
     return HybridRetriever(collection_name, qdrant_client, embed_model)

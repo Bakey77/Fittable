@@ -1,1 +1,25 @@
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload 
+curl http://localhost:6333/collections/fitness_guide
+open /Users/liaomeiqi/Downloads/Fit-Agent/front/index.html
+(hld) (base) liaomeiqi@liaomeiqideMacBook-Air Fit-Agent % python -m backend.main
+python scripts/eval_workout_rag.py --fusion-k 10 --k 3 5 10
+
+python scripts/eval_workout_rag.py --methods vector --debug  纯向量检索
+python scripts/eval_workout_rag.py --methods hybrid --debug  混合检索（BM25 + 向量）
+python scripts/eval_workout_rag.py --methods hybrid_rewrite --debug 只跑rewrite
+python scripts/eval_workout_rag.py --methods hybrid_rewrite_rerank --debug 混合检索（BM25 + 向量 + rewrite + rerank）
+
+python3 -m venv vibe
+
+front % cd /Users/liaomeiqi/Downloads/Fit-Agent/front && python -m http.server 5173
+curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "你好"}'
+curl -N -X POST http://localhost:8000/chat/stream \                                                                                                                               
+-H "Content-Type: application/json" \
+    -d '{"message": "你好"}'   
+
+`git add -A && git commit -m "阶段1.1: 添加Redis连接池"`
+
+python uploads/build_index.py  构建向量索引
+
+curl http://localhost:8000/health | python -m json.tool  #格式优化
+curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "深蹲怎么做"}' | python -m json.tool

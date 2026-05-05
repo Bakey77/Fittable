@@ -20,7 +20,7 @@ class AgentState(TypedDict):
     - user_input/profile/waiting_info/pending_*: 来自 run_workflow 入参或 session memory 回填
     - intents/primary_intent/entities: 来自 intent_classifier_node
     - guidance/plan/status/follow_up_questions/metadata: 来自 guidance_node 或 planning_node
-    - memory_summary/recent_turns: 来自短期记忆读取
+    - recent_turns: 来自短期记忆读取
 
     输出/流向:
     - 被 LangGraph 各节点读取并更新
@@ -37,9 +37,8 @@ class AgentState(TypedDict):
     pending_intent: str | None        # 上一轮识别的意图
     pending_entities: dict | None     # 上一轮已提取的实体
 
-    # 短期记忆（可选字段，不影响现有节点逻辑）
+    # 短期记忆
     session_id: str | None           # 当前 session ID
-    memory_summary: str | None       # 历史摘要（裁剪后）
     recent_turns: list[dict[str, str]] | None  # 最近对话轮次
     long_memory: str | None         # 长期记忆 markdown（持久化存储）
 

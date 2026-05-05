@@ -134,6 +134,7 @@ def should_update_long_memory(session_id: str, recent_turns: list[dict]) -> bool
     total_turns = metadata.get("total_turns", 0)
 
     if total_turns < BATCH_SIZE:
+        print(f"[LONG_MEMORY] skip: total_turns={total_turns} < BATCH_SIZE={BATCH_SIZE}")
         return False
 
     if total_turns % BATCH_SIZE != 0:
@@ -143,25 +144,18 @@ def should_update_long_memory(session_id: str, recent_turns: list[dict]) -> bool
     processed_batch = metadata.get("long_memory_batch_processed", 0)
 
     if current_batch <= processed_batch:
+        print(f"[LONG_MEMORY] skip: batch {current_batch} already processed (processed_batch={processed_batch})")
         return False
 
+    print(f"[LONG_MEMORY] TRIGGER: total_turns={total_turns} batch={current_batch} processed_batch={processed_batch}")
     return True
 
 
 def mark_batch_processed(session_id: str) -> None:
-    """标记当前批次已处理（更新批次游标）。"""
+    """标记当前批次已处理（原子操作，更新批次游标）。"""
     from . import session_memory
 
-    full_memory = session_memory.get_session_memory(session_id)
-    metadata = full_memory.get("metadata", {})
-    total_turns = metadata.get("total_turns", 0)
-    current_batch = total_turns // BATCH_SIZE
-
-    if "metadata" not in full_memory:
-        full_memory["metadata"] = {}
-    full_memory["metadata"]["long_memory_batch_processed"] = current_batch
-
-    session_memory._save_memory(session_id, full_memory)
+    session_memory.update_metadata(session_id, "mark_batch_processed", BATCH_SIZE)
 
 
 def build_recent_batch(recent_turns: list[dict], batch_size: int = BATCH_SIZE) -> list[dict]:
@@ -506,7 +500,7 @@ def update_long_memory(
         "conflict_notice": str | None,  # 提示用户的文案
       }
     """
-    from backend.services.llm import get_llm
+    from backend.services.llm import get_longcat_llm
 
     # 1. 加载当前长期记忆
     current_obj = load_long_memory(session_id)
@@ -514,7 +508,7 @@ def update_long_memory(
 
     # 2. 调用 LLM 分析更新
     try:
-        llm = get_llm()
+        llm = get_longcat_llm()
         prompt = _build_update_prompt(recent_turns_batch, current_md, latest_entities, latest_intent)
         response = llm.invoke([{"role": "user", "content": prompt}])
         raw_output = response.content if hasattr(response, "content") else str(response)
@@ -537,7 +531,7 @@ def update_long_memory(
                 applied_updates.extend([f"{section}.{k}" for k in fields.keys()])
 
     except Exception as e:
-        logger.warning(f"LLM update failed for {session_id}: {e}")
+        logger.error(f"[LONG_MEMORY] LLM update FAILED for session={session_id}: {e}", exc_info=True)
         return {
             "success": False,
             "conflicts": [],
@@ -563,7 +557,7 @@ def update_long_memory(
     try:
         save_long_memory(session_id, merged)
     except Exception as e:
-        logger.warning(f"Save failed for {session_id}: {e}")
+        logger.error(f"[LONG_MEMORY] Save FAILED for session={session_id}: {e}", exc_info=True)
         return {
             "success": False,
             "conflicts": conflicts,
@@ -641,7 +635,7 @@ def update_if_needed(
             "conflict_notice": result.get("conflict_notice"),
         }
     except Exception as e:
-        logger.warning(f"Long memory update failed for {session_id}: {e}")
+        logger.error(f"[LONG_MEMORY] update_if_needed FAILED for session={session_id}: {e}", exc_info=True)
         return {
             "triggered": True,
             "success": False,

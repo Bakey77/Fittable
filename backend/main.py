@@ -328,7 +328,10 @@ async def chat(
 
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(_executor, run_workflow, req.message, sid)
+        def run_sync_workflow():
+            return run_workflow(req.message, session_id=sid)
+
+        result = await loop.run_in_executor(_executor, run_sync_workflow)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -366,6 +369,12 @@ async def chat(
             "调用 /compress-retry 重试，或 /compress-discard 丢弃。"
         )
 
+    # 透传多意图字段
+    if result.get("multi_intent", {}).get("enabled"):
+        resp["primary_output"] = result.get("primary_output")
+        resp["secondary_output"] = result.get("secondary_output")
+        resp["multi_intent"] = result.get("multi_intent")
+
     return resp
 
 
@@ -392,7 +401,7 @@ async def chat_stream(
     # result = await loop.run_in_executor(ThreadPoolExecutor(), run_sync_workflow) #把workflow丢给一个单独的线程去执行
 
     result = await loop.run_in_executor(_executor, run_sync_workflow)  # 使用全局线程池
-    global _tasks_completed
+    global _task_completed
     with _task_lock:
         _task_completed += 1
 
@@ -465,12 +474,19 @@ async def chat_stream(
         # Stage 3: 发送 intent（拿到分类结果后）
         yield f"data: {json.dumps({'intent': primary_intent})}\n\n"
 
-        # Stage 4: 正文按行 chunk 流出
+        # Stage 4: 正文按行 chunk 流出（仅主意图文本）
         CHUNK_SIZE = 60  # 约60字符/块，兼顾实时性与网络效率
         for i in range(0, len(text), CHUNK_SIZE):
             chunk = text[i:i+CHUNK_SIZE]
             yield f"data: {json.dumps({'text': chunk})}\n\n"
             await asyncio.sleep(0)  # 让出控制权，允许其他协程执行
+
+        # Stage 5: 次意图摘要（如有，作为最终事件附加）
+        if result.get("multi_intent", {}).get("enabled") and result.get("secondary_output"):
+            sec = result["secondary_output"]
+            sec_payload = sec.get("payload", "")
+            sec_text = str(sec_payload) if not isinstance(sec_payload, str) else sec_payload
+            yield f"data: {json.dumps({'type': 'secondary_summary', 'intent': sec.get('intent'), 'text': sec_text[:500]})}\n\n"
 
         yield "data: [DONE]\n\n"
 

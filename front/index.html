@@ -1,175 +1,873 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>健身健康助手</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        /* =====================================================================
+           CSS 变量 - 训练控制台色板
+           ===================================================================== */
+        :root {
+            --bg: #111315;
+            --surface: #191c1f;
+            --surface-hover: #1f2226;
+            --border: #2a2f35;
+            --border-light: #333840;
+            --text: #eef2f5;
+            --text-secondary: #c4cad2;
+            --muted: #9aa4af;
+            --dim: #5f6975;
+            --accent: #ff5a2a;
+            --accent-hover: #e64d1c;
+            --accent-muted: rgba(255, 90, 42, 0.12);
+            --success: #22c55e;
+            --error: #ef4444;
+            --error-muted: rgba(239, 68, 68, 0.1);
+            --user-bg: #1f1a17;
+            --user-border: #3d2a1c;
+            --ai-bg: #191c1f;
+            --ai-border: #2a2f35;
+            --radius: 10px;
+            --radius-sm: 6px;
+            --radius-lg: 14px;
+            --shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        /* =====================================================================
+           Reset / Base
+           ===================================================================== */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
-            font-family: sans-serif;
-            max-width: 700px;
-            margin: 30px auto;
+            font-family: 'Inter', 'SF Pro Display', -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            line-height: 1.5;
+        }
+
+        /* =====================================================================
+           App Container - 双栏布局
+           ===================================================================== */
+        .app {
+            width: 100%;
+            max-width: 1140px;
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            grid-template-rows: auto 1fr auto;
+            grid-template-areas:
+                "topbar topbar"
+                "main   sidebar"
+                "input  sidebar";
+            gap: 0;
+            min-height: 100vh;
             padding: 0 20px;
         }
+
+        /* =====================================================================
+           Top Bar
+           ===================================================================== */
+        .topbar {
+            grid-area: topbar;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0;
+        }
+
+        .topbar-logo {
+            width: 38px;
+            height: 38px;
+            background: var(--accent);
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .topbar-brand h1 {
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: -0.2px;
+            color: var(--text);
+            line-height: 1.1;
+        }
+
+        .topbar-brand span {
+            font-size: 11px;
+            color: var(--muted);
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+
+        .topbar-right {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .status-dot {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--muted);
+            font-weight: 500;
+        }
+
+        .status-dot::before {
+            content: '';
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            flex-shrink: 0;
+        }
+
+        .btn-clear {
+            padding: 7px 14px;
+            background: transparent;
+            color: var(--muted);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: inherit;
+            transition: all 0.15s;
+            white-space: nowrap;
+        }
+
+        .btn-clear:hover {
+            border-color: var(--error);
+            color: var(--error);
+            background: var(--error-muted);
+        }
+
+        /* =====================================================================
+           Main Chat Area
+           ===================================================================== */
+        .main-area {
+            grid-area: main;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            padding-right: 24px;
+        }
+
         .chat-box {
-            border: 1px solid #ddd;
-            height: 450px;
+            flex: 1;
             overflow-y: auto;
-            padding: 15px;
-            margin-bottom: 15px;
-            background: #fafafa;
+            padding: 16px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            scroll-behavior: smooth;
+            min-height: 300px;
+            max-height: calc(100vh - 260px);
         }
-        .msg { margin: 8px 0; }
-        .user {
-            color: #1a73e8;
-            font-weight: bold;
+
+        .chat-box::-webkit-scrollbar { width: 4px; }
+        .chat-box::-webkit-scrollbar-track { background: transparent; }
+        .chat-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+        /* =====================================================================
+           Empty State
+           ===================================================================== */
+        .chat-empty {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+            gap: 16px;
+            color: var(--dim);
+            text-align: center;
+            padding: 30px 20px;
         }
-        .ai {
-            color: #333;
-            line-height: 1.5;
+
+        .chat-empty .icon {
+            font-size: 36px;
+            opacity: 0.5;
+        }
+
+        .chat-empty h2 {
+            font-size: 17px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .chat-empty p {
+            font-size: 13px;
+            color: var(--dim);
+            max-width: 340px;
+        }
+
+        .suggestions {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .suggestion-btn {
+            padding: 10px 16px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-family: inherit;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.15s;
+        }
+
+        .suggestion-btn:hover {
+            border-color: var(--accent);
+            color: var(--text);
+            background: var(--accent-muted);
+        }
+
+        .suggestion-btn:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        /* =====================================================================
+           Messages
+           ===================================================================== */
+        .msg {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            animation: msg-in 0.25s ease forwards;
+            opacity: 0;
+            transform: translateY(6px);
+        }
+
+        @keyframes msg-in {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .msg.user { align-items: flex-end; }
+
+        .msg.user .bubble {
+            background: var(--user-bg);
+            border: 1px solid var(--user-border);
+            border-radius: var(--radius) var(--radius) 4px var(--radius);
+            padding: 10px 14px;
+            max-width: 78%;
+            font-size: 14px;
+            line-height: 1.55;
+            color: var(--text);
+        }
+
+        .msg.user .bubble::before {
+            content: '你';
+            display: block;
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--accent);
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .msg.ai { align-items: flex-start; }
+
+        .msg.ai .bubble {
+            background: var(--ai-bg);
+            border: 1px solid var(--ai-border);
+            border-radius: 4px var(--radius) var(--radius) var(--radius);
+            padding: 10px 14px;
+            max-width: 85%;
+            font-size: 14px;
+            line-height: 1.65;
+            color: var(--text);
             white-space: pre-wrap;
         }
-        .ai::before {
-            content: "AI: ";
-            color: #888;
+
+        .msg.ai .bubble::before {
+            content: '助手';
+            display: block;
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--muted);
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
         }
-        .input-row {
-            display: flex;
-            gap: 10px;
-        }
-        #msg {
-            flex: 1;
-            padding: 10px;
-            font-size: 15px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-        }
-        #msg:focus {
-            outline: none;
-            border-color: #1a73e8;
-        }
-        button {
-            padding: 10px 20px;
-            background: #1a73e8;
-            color: white;
-            border: none;
-            cursor: pointer;
-            border-radius: 4px;
-        }
-        button:hover { background: #1557b0; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
+
         .intent-tag {
-            font-size: 12px;
-            color: #888;
-            margin-left: 5px;
+            font-size: 11px;
+            color: var(--accent);
+            font-weight: 600;
+            margin-bottom: 2px;
+            letter-spacing: 0.2px;
         }
-        .error-msg {
-            color: #e74c3c;
+
+        .ai-meta {
+            font-size: 11px;
+            color: var(--dim);
+            padding: 0 4px;
+        }
+
+        .ai-meta.typing::after {
+            content: '▊';
+            animation: blink 1s step-end infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        .msg.error .bubble {
+            border-color: var(--error);
+            color: var(--error);
             font-size: 13px;
-            margin-top: 8px;
-            text-align: center;
         }
-        .session-row {
-            margin-bottom: 10px;
+
+        .typing-dots {
             display: flex;
-            gap: 10px;
+            gap: 3px;
+            padding: 2px 0;
+        }
+
+        .typing-dots span {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--dim);
+            animation: dot-bounce 1.2s ease-in-out infinite;
+        }
+
+        .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes dot-bounce {
+            0%, 100% { transform: translateY(0); opacity: 0.4; }
+            50% { transform: translateY(-3px); opacity: 1; }
+        }
+
+        /* =====================================================================
+           Input Row
+           ===================================================================== */
+        .input-area {
+            grid-area: input;
+            display: flex;
+            gap: 8px;
+            padding: 16px 24px 20px 0;
+            border-top: 1px solid var(--border);
             align-items: center;
         }
-        .session-row input {
+
+        .input-area input {
             flex: 1;
-            padding: 8px 10px;
-            font-size: 13px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 11px 16px;
+            font-size: 14px;
+            border-radius: var(--radius);
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s;
         }
-        .btn-clear {
-            padding: 8px 14px;
-            background: #e74c3c;
-            color: white;
+
+        .input-area input::placeholder { color: var(--dim); }
+
+        .input-area input:focus {
+            border-color: var(--accent);
+        }
+
+        .input-area input:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
+        }
+
+        .btn-send {
+            padding: 11px 24px;
+            background: var(--accent);
+            color: #fff;
             border: none;
+            border-radius: var(--radius);
             cursor: pointer;
-            border-radius: 4px;
-            font-size: 13px;
+            font-size: 14px;
+            font-weight: 600;
+            font-family: inherit;
+            transition: all 0.15s;
+            flex-shrink: 0;
         }
-        .btn-clear:hover { background: #c0392b; }
-        .ai-meta {
+
+        .btn-send:hover:not(:disabled) {
+            background: var(--accent-hover);
+        }
+
+        .btn-send:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .btn-send:disabled {
+            background: var(--border);
+            color: var(--dim);
+            cursor: not-allowed;
+        }
+
+        .error-msg {
+            grid-column: 1;
+            color: var(--error);
             font-size: 12px;
-            color: #aaa;
-            margin-top: 2px;
+            padding: 4px 24px 8px 0;
+            min-height: 0;
+            text-align: left;
+        }
+
+        /* =====================================================================
+           Sidebar
+           ===================================================================== */
+        .sidebar {
+            grid-area: sidebar;
+            padding: 20px 0 20px 0;
+            border-left: 1px solid var(--border);
+            padding-left: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            overflow-y: auto;
+        }
+
+        .sidebar-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 16px;
+        }
+
+        .sidebar-card h3 {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 12px;
+        }
+
+        /* Goal Card */
+        .goal-stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+        }
+
+        .goal-stat + .goal-stat {
+            border-top: 1px solid var(--border);
+        }
+
+        .goal-stat .label {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .goal-stat .value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .goal-stat .value.accent { color: var(--accent); }
+
+        /* Quick Questions */
+        .quick-questions {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .quick-btn {
+            width: 100%;
+            padding: 9px 12px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-size: 12px;
+            font-family: inherit;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.15s;
+            line-height: 1.4;
+        }
+
+        .quick-btn:hover {
+            border-color: var(--accent);
+            color: var(--text);
+            background: var(--accent-muted);
+        }
+
+        .quick-btn:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        /* Session Status */
+        .session-field {
+            margin-bottom: 8px;
+        }
+
+        .session-field label {
+            display: block;
+            font-size: 11px;
+            color: var(--dim);
+            margin-bottom: 4px;
+            font-weight: 500;
+        }
+
+        .session-field input {
+            width: 100%;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 7px 10px;
+            border-radius: var(--radius-sm);
+            font-size: 12px;
+            font-family: 'SF Mono', 'Menlo', monospace;
+            outline: none;
+        }
+
+        .session-field input:focus {
+            border-color: var(--accent);
+        }
+
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 5px 0;
+            font-size: 12px;
+        }
+
+        .status-row .label { color: var(--dim); }
+
+        .status-row .value {
+            color: var(--text-secondary);
+            font-weight: 500;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .status-row .value.intent-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            background: var(--accent-muted);
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        /* =====================================================================
+           Responsive - 移动端单栏
+           ===================================================================== */
+        @media (max-width: 800px) {
+            .app {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto 1fr auto auto;
+                grid-template-areas:
+                    "topbar"
+                    "main"
+                    "input"
+                    "sidebar";
+                padding: 0 12px;
+            }
+
+            .main-area { padding-right: 0; }
+
+            .sidebar {
+                border-left: none;
+                border-top: 1px solid var(--border);
+                padding-left: 0;
+                padding-top: 16px;
+            }
+
+            .input-area {
+                padding-right: 0;
+            }
+
+            .chat-box { max-height: none; min-height: 350px; }
+
+            .topbar-right .status-dot { display: none; }
         }
     </style>
 </head>
 <body>
-    <h1>🏋️ 健身健康助手</h1>
+    <div class="app">
+        <!-- ================================================================
+             Top Bar
+             ================================================================ -->
+        <header class="topbar">
+            <div class="topbar-logo">&#x1F4AA;</div>
+            <div class="topbar-brand">
+                <h1>健身健康助手</h1>
+                <span>AI Fitness Coach</span>
+            </div>
+            <div class="topbar-right">
+                <span class="status-dot">在线</span>
+                <button class="btn-clear" onclick="clearSession()">清空记忆</button>
+            </div>
+        </header>
 
-    <div class="session-row">
-        <input id="sessionInput" placeholder="session_id（留空自动生成）">
-        <button class="btn-clear" onclick="clearSession()">清空记忆</button>
+        <!-- ================================================================
+             Main Chat Area
+             ================================================================ -->
+        <div class="main-area">
+            <div class="chat-box" id="chatBox">
+                <div class="chat-empty" id="chatEmpty">
+                    <div class="icon">&#x1F3CB;&#xFE0F;</div>
+                    <h2>今天想练什么？</h2>
+                    <p>我是你的专属健身教练，可以帮你制定训练计划、指导动作、分析饮食</p>
+                    <div class="suggestions">
+                        <button class="suggestion-btn" onclick="sendSuggestion('帮我制定一个增肌训练计划，每周4天')">&#x1F4CB; 帮我制定一个增肌训练计划，每周4天</button>
+                        <button class="suggestion-btn" onclick="sendSuggestion('深蹲怎么做才不伤膝盖？')">&#x1F3CB;&#xFE0F; 深蹲怎么做才不伤膝盖？</button>
+                        <button class="suggestion-btn" onclick="sendSuggestion('帮我分析今天饮食的营养成分')">&#x1F372; 帮我分析今天饮食的营养成分</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================================================================
+             Input Area
+             ================================================================ -->
+        <div class="input-area">
+            <input id="msg" placeholder="输入你的健身问题..." onkeydown="if(event.key==='Enter')send()" autofocus>
+            <button class="btn-send" onclick="send()" id="sendBtn">发送</button>
+        </div>
+        <div class="error-msg" id="errorMsg"></div>
+
+        <!-- ================================================================
+             Sidebar
+             ================================================================ -->
+        <aside class="sidebar">
+            <!-- 今日目标 -->
+            <div class="sidebar-card">
+                <h3>&#x1F3AF; 今日目标</h3>
+                <div class="goal-stat">
+                    <span class="label">训练状态</span>
+                    <span class="value accent" id="goalStatus">准备开始</span>
+                </div>
+                <div class="goal-stat">
+                    <span class="label">目标</span>
+                    <span class="value" id="goalTarget">—</span>
+                </div>
+                <div class="goal-stat">
+                    <span class="label">每周训练</span>
+                    <span class="value" id="goalFrequency">—</span>
+                </div>
+                <div class="goal-stat">
+                    <span class="label">计划天数</span>
+                    <span class="value" id="goalDays">—</span>
+                </div>
+            </div>
+
+            <!-- 快捷提问 -->
+            <div class="sidebar-card">
+                <h3>&#x26A1; 快捷提问</h3>
+                <div class="quick-questions">
+                    <button class="quick-btn" onclick="fillInput('给我一个一周训练计划')">&#x1F4C5; 训练计划</button>
+                    <button class="quick-btn" onclick="fillInput('硬拉标准动作要领')">&#x1F3CB;&#xFE0F; 动作指导</button>
+                    <button class="quick-btn" onclick="fillInput('帮我做一份减脂餐食谱')">&#x1F372; 减脂食谱</button>
+                    <button class="quick-btn" onclick="fillInput('鸡胸肉蛋白质含量多少')">&#x1F4CA; 饮食分析</button>
+                </div>
+            </div>
+
+            <!-- 会话状态 -->
+            <div class="sidebar-card">
+                <h3>&#x1F4E1; 会话状态</h3>
+                <div class="session-field">
+                    <label for="sessionInput">Session ID</label>
+                    <input id="sessionInput" placeholder="自动生成" readonly>
+                </div>
+                <div class="status-row">
+                    <span class="label">当前意图</span>
+                    <span class="value" id="statusIntent">—</span>
+                </div>
+                <div class="status-row">
+                    <span class="label">处理阶段</span>
+                    <span class="value" id="statusStage">等待输入</span>
+                </div>
+                <div class="status-row">
+                    <span class="label">最近轮次</span>
+                    <span class="value" id="statusTurns">—</span>
+                </div>
+            </div>
+        </aside>
     </div>
-
-    <div class="chat-box" id="chatBox"></div>
-
-    <div class="input-row">
-        <input id="msg" placeholder="输入你的问题..." onkeydown="if(event.key==='Enter')send()">
-        <button onclick="send()" id="sendBtn">发送</button>
-    </div>
-
-    <div class="error-msg" id="errorMsg"></div>
 
     <script>
+        /* =================================================================
+           状态变量
+           ================================================================ */
         let isLoading = false;
+        let turnCount = 0;
+        let currentIntent = null;
+
         const isLocalBackendOrigin =
             (window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost") &&
             window.location.port === "8000";
-        const API_BASE = isLocalBackendOrigin ? "" : "http://127.0.0.1:8000";
+        const API_BASE = isLocalBackendOrigin ? "" : "http://localhost:8000";
 
         function apiUrl(path) {
             return `${API_BASE}${path}`;
         }
 
+        /* =================================================================
+           辅助函数
+           ================================================================ */
+        function escapeHtml(text) {
+            return String(text)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+        }
+
+        function setError(msg) {
+            const el = document.getElementById("errorMsg");
+            el.textContent = msg || "";
+        }
+
+        function updateStatus(intent, stage) {
+            if (intent) {
+                const el = document.getElementById("statusIntent");
+                const labelMap = {
+                    training_guidance: "动作指导",
+                    training_plan: "训练计划",
+                    diet_analysis: "饮食分析",
+                    meal_planning: "餐食规划",
+                    general: "一般对话"
+                };
+                el.textContent = labelMap[intent] || intent;
+                el.className = "value intent-badge";
+            }
+            if (stage) {
+                document.getElementById("statusStage").textContent =
+                    stage === "processing" ? "思考中..." : stage;
+            }
+        }
+
+        function updateTurns() {
+            turnCount++;
+            document.getElementById("statusTurns").textContent = `第 ${turnCount} 轮`;
+        }
+
+        function updateGoalCard(meta) {
+            if (meta.status)  document.getElementById("goalStatus").textContent = meta.status;
+            if (meta.target)  document.getElementById("goalTarget").textContent = meta.target;
+            if (meta.freq)    document.getElementById("goalFrequency").textContent = meta.freq;
+            if (meta.days)    document.getElementById("goalDays").textContent = meta.days;
+        }
+
+        function resetGoalCard() {
+            document.getElementById("goalStatus").textContent = "准备开始";
+            document.getElementById("goalTarget").textContent = "—";
+            document.getElementById("goalFrequency").textContent = "—";
+            document.getElementById("goalDays").textContent = "—";
+        }
+
+        function parsePlanMeta(text) {
+            const meta = {};
+            const goalMatch = text.match(/训练计划[：:]\s*(.+)/);
+            if (goalMatch) {
+                meta.target = goalMatch[1].trim();
+                meta.status = "计划已生成";
+            }
+            const freqMatch = text.match(/每周训练[：:]\s*(\d+)\s*天/);
+            if (freqMatch) meta.freq = `${freqMatch[1]} 天/周`;
+            const dayMatches = text.match(/第\d+天/g);
+            if (dayMatches) meta.days = `${dayMatches.length} 天`;
+            return meta;
+        }
+
+        /* =================================================================
+           快捷操作
+           ================================================================ */
+        function fillInput(text) {
+            const input = document.getElementById("msg");
+            input.value = text;
+            input.focus();
+        }
+
+        function sendSuggestion(text) {
+            document.getElementById("msg").value = text;
+            send();
+        }
+
+        /* =================================================================
+           发送消息（保留原有流式逻辑）
+           ================================================================ */
         async function send() {
             const input = document.getElementById("msg");
             const text = input.value.trim();
             if (!text || isLoading) return;
-            const sessionInput = document.getElementById("sessionInput");
-            const sessionId = sessionInput.value.trim();
 
-            const errorEl = document.getElementById("errorMsg");
-            errorEl.textContent = "";
+            setError("");
             isLoading = true;
             document.getElementById("sendBtn").disabled = true;
             input.value = "";
 
             const box = document.getElementById("chatBox");
 
-            // 用户消息
-            box.innerHTML += `<div class="msg user">你: ${escapeHtml(text)}</div>`;
+            /* 隐藏空状态 */
+            const emptyEl = document.getElementById("chatEmpty");
+            if (emptyEl) emptyEl.style.display = "none";
 
-            // AI 消息占位
+            /* ---- 用户消息 ---- */
+            const userDiv = document.createElement("div");
+            userDiv.className = "msg user";
+            userDiv.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+            box.appendChild(userDiv);
+
+            /* ---- AI 消息占位 ---- */
             const aiDiv = document.createElement("div");
             aiDiv.className = "msg ai";
+
             const intentTag = document.createElement("span");
             intentTag.className = "intent-tag";
+
             const textSpan = document.createElement("span");
-            const aiMeta = document.createElement("div");
-            aiMeta.className = "ai-meta";
+            textSpan.className = "bubble";
+
+            const metaDiv = document.createElement("div");
+            metaDiv.className = "ai-meta typing";
+            metaDiv.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+
             aiDiv.appendChild(intentTag);
             aiDiv.appendChild(textSpan);
-            aiDiv.appendChild(aiMeta);
+            aiDiv.appendChild(metaDiv);
             box.appendChild(aiDiv);
 
-            // 收集文本
+            /* ---- 流式读取 ---- */
             let fullText = "";
             let buffer = "";
 
             try {
-                const payload = {message: text};
-                if (sessionId) payload.session_id = sessionId;
-
                 const resp = await fetch(apiUrl("/chat/stream"), {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({message: text}),
+                    credentials: "include"
                 });
 
                 if (!resp.ok) {
@@ -199,42 +897,63 @@
                             const data = line.slice(6);
                             if (data === "[DONE]") continue;
 
-                            // 先尝试解析 JSON（session_id / intent / error）
                             try {
                                 const obj = JSON.parse(data);
-                                // 只对 JSON 对象使用 continue；primitive 值（数字/布尔等）走下面文本处理
                                 if (typeof obj === "object" && obj !== null && !Array.isArray(obj)) {
+                                    /* session_id */
                                     if (obj.session_id) {
-                                        sessionInput.value = obj.session_id;
+                                        document.getElementById("sessionInput").value = obj.session_id;
                                     }
+                                    /* stage */
+                                    if (obj.stage) {
+                                        updateStatus(null, obj.stage);
+                                    }
+                                    /* intent */
                                     if (obj.intent) {
-                                        intentTag.textContent = `[${obj.intent}] `;
-                                        fullText += `\n`;
+                                        intentTag.textContent = `[${obj.intent}]`;
+                                        updateStatus(obj.intent, null);
+                                        currentIntent = obj.intent;
                                     }
+                                    /* error */
                                     if (obj.error) {
                                         fullText += `\n错误: ${obj.error}`;
                                         textSpan.textContent = fullText;
                                     }
+                                    /* text chunk */
+                                    if (obj.text !== undefined) {
+                                        fullText += obj.text;
+                                        textSpan.textContent = fullText;
+                                        metaDiv.innerHTML = "";
+                                        metaDiv.className = "ai-meta";
+                                        /* 训练计划：从流式文本中实时解析目标卡数据 */
+                                        if (currentIntent === "training_plan") {
+                                            const meta = parsePlanMeta(fullText);
+                                            if (Object.keys(meta).length > 0) updateGoalCard(meta);
+                                        }
+                                    }
                                     continue;
                                 }
                             } catch {
-                                // 不是 JSON，就是普通文本字符（含换行、空格等）
-                            }
-
-                            // 普通文本字符：保留原样，包括换行和空格
-                            if (data) {
-                                fullText += data;
-                                textSpan.textContent = fullText;
+                                /* 非 JSON 行，忽略 */
                             }
                         }
                     }
                 }
 
-                aiMeta.textContent = `status: 完整`;
+                metaDiv.textContent = "完成";
+                metaDiv.className = "ai-meta";
+
+                /* 流结束后最终解析一次目标卡 */
+                if (currentIntent === "training_plan") {
+                    const meta = parsePlanMeta(fullText);
+                    if (Object.keys(meta).length > 0) updateGoalCard(meta);
+                }
+                updateTurns();
 
             } catch (err) {
-                errorEl.textContent = "请求失败: " + err.message;
-                aiDiv.innerHTML = `<span style="color:#e74c3c">请求失败: ${escapeHtml(err.message)}</span>`;
+                setError("请求失败: " + err.message);
+                aiDiv.innerHTML = `<div class="bubble" style="color:${getComputedStyle(document.documentElement).getPropertyValue('--error')};border-color:${getComputedStyle(document.documentElement).getPropertyValue('--error')}">请求失败: ${escapeHtml(err.message)}</div>`;
+                aiDiv.className = "msg error";
             } finally {
                 isLoading = false;
                 document.getElementById("sendBtn").disabled = false;
@@ -242,10 +961,13 @@
             }
         }
 
+        /* =================================================================
+           清空 Session（保留原有逻辑，inline 提示替代 alert）
+           ================================================================ */
         async function clearSession() {
             const sid = document.getElementById("sessionInput").value.trim();
             if (!sid) {
-                alert("请先输入要清空的 session_id");
+                setError("请先在会话状态区确认 session_id（发送消息后自动生成）");
                 return;
             }
             if (!confirm(`确定要清空 session "${sid}" 的记忆吗？`)) return;
@@ -254,23 +976,35 @@
                 const resp = await fetch(apiUrl("/clear-session"), {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({session_id: sid})
+                    body: "{}",
+                    credentials: "include"
                 });
                 const data = await resp.json();
                 if (data.success) {
-                    document.getElementById("chatBox").innerHTML = "";
+                    document.getElementById("chatBox").innerHTML =
+                        '<div class="chat-empty" id="chatEmpty">' +
+                        '<div class="icon">&#x1F3CB;&#xFE0F;</div>' +
+                        '<h2>今天想练什么？</h2>' +
+                        '<p>我是你的专属健身教练，可以帮你制定训练计划、指导动作、分析饮食</p>' +
+                        '<div class="suggestions">' +
+                        '<button class="suggestion-btn" onclick="sendSuggestion(\'帮我制定一个增肌训练计划，每周4天\')">&#x1F4CB; 帮我制定一个增肌训练计划，每周4天</button>' +
+                        '<button class="suggestion-btn" onclick="sendSuggestion(\'深蹲怎么做才不伤膝盖？\')">&#x1F3CB;&#xFE0F; 深蹲怎么做才不伤膝盖？</button>' +
+                        '<button class="suggestion-btn" onclick="sendSuggestion(\'帮我分析今天饮食的营养成分\')">&#x1F372; 帮我分析今天饮食的营养成分</button>' +
+                        '</div>' +
+                        '</div>';
                     document.getElementById("sessionInput").value = "";
+                    document.getElementById("statusIntent").textContent = "—";
+                    document.getElementById("statusIntent").className = "value";
+                    document.getElementById("statusStage").textContent = "等待输入";
+                    document.getElementById("statusTurns").textContent = "—";
+                    turnCount = 0;
+                    currentIntent = null;
+                    resetGoalCard();
+                    setError("");
                 }
             } catch (err) {
-                alert("清空失败: " + err.message);
+                setError("清空失败: " + err.message);
             }
-        }
-
-        function escapeHtml(text) {
-            return String(text)
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;");
         }
     </script>
 </body>

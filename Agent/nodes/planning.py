@@ -10,7 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from backend.services.llm import get_llm
+from backend.services.llm import get_longcat_llm
 from ..intent_classifier import parse_json_from_text
 
 
@@ -27,7 +27,7 @@ CN_NUM_MAP = {
 
 
 def _call_llm(prompt: str) -> str:
-    llm = get_llm()
+    llm = get_longcat_llm()
     response = llm.invoke([{"role": "user", "content": prompt}])
     return response.content if hasattr(response, "content") else str(response)
 
@@ -56,9 +56,18 @@ def _extract_positive_int(value: Any) -> int | None:
     return None
 
 
-def _extract_plan_entities_with_llm(user_input: str, long_memory: str | None = None) -> dict[str, Any]:
-    mem_section = f"\n用户长期记忆：\n{long_memory}\n" if long_memory else ""
-    prompt = f"""你是信息抽取器。请从用户输入中提取训练计划相关实体。{mem_section}
+def _extract_plan_entities_with_llm(user_input: str, long_memory: str | None = None, recent_turns: list | None = None) -> dict[str, Any]:
+    mem_parts = []
+    if long_memory:
+        mem_parts.append(f"【长期记忆】\n{long_memory}")
+    if recent_turns:
+        mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
+            f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
+            for t in recent_turns
+        ))
+    mem_section = "\n\n".join(mem_parts)
+    mem_block = f"\n{mem_section}\n" if mem_section else ""
+    prompt = f"""你是信息抽取器。请从用户输入中提取训练计划相关实体，结合记忆上下文理解用户意图。{mem_block}
 用户输入：{user_input}
 
 只输出 JSON：
@@ -93,6 +102,8 @@ class PlanningSubgraphState(dict):
     status: str
     follow_up_questions: list[str]
     waiting_info: dict | None
+    long_memory: str | None
+    recent_turns: list | None
     _route: str  # internal routing signal returned by check node
 
 
@@ -103,7 +114,8 @@ def _subgraph_extract(state: PlanningSubgraphState) -> dict:
     """从用户输入提取实体"""
     user_input = state["user_input"]
     long_memory = state.get("long_memory")
-    extracted = _extract_plan_entities_with_llm(user_input, long_memory)
+    recent_turns = state.get("recent_turns")
+    extracted = _extract_plan_entities_with_llm(user_input, long_memory, recent_turns)
     return {"extracted_entities": extracted}
 
 
@@ -167,9 +179,19 @@ def _subgraph_generate_plan(state: PlanningSubgraphState) -> dict:
     goal = _normalize_goal(pending.get("goal"))
     frequency = _extract_positive_int(pending.get("frequency"))
     long_memory = state.get("long_memory")
+    recent_turns = state.get("recent_turns")
 
-    mem_section = f"\n用户长期记忆：\n{long_memory}\n" if long_memory else ""
-    prompt = f"""你是一个专业健身教练。请基于以下信息生成训练计划。{mem_section}
+    mem_parts = []
+    if long_memory:
+        mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+    if recent_turns:
+        mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
+            f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
+            for t in recent_turns
+        ))
+    mem_section = "\n\n".join(mem_parts)
+    mem_block = f"\n{mem_section}\n" if mem_section else ""
+    prompt = f"""你是一个专业健身教练。请基于以下信息和记忆上下文生成训练计划。{mem_block}
 - 目标: {goal}
 - 每周训练: {frequency} 天
 
@@ -193,6 +215,7 @@ def _subgraph_generate_plan(state: PlanningSubgraphState) -> dict:
             "status": "error",
             "follow_up_questions": ["生成计划失败，请重试"],
             "pending_intent": None,  # 失败也清空，避免无限循环
+            "pending_entities": None,
         }
 
     return {
@@ -201,7 +224,7 @@ def _subgraph_generate_plan(state: PlanningSubgraphState) -> dict:
         "follow_up_questions": [],
         "waiting_info": None,
         "pending_intent": None,  # 计划生成成功，清空 pending_intent
-        "pending_entities": pending,  # 保留，供后续追问使用
+        "pending_entities": None,  # 计划已生成，清空实体，避免下一轮沿用旧值
     }
 
 
@@ -273,6 +296,7 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
     - plan / status / follow_up_questions / waiting_info / pending_entities
     """
     user_input = state["user_input"]
+    print(f"[PLANNING-NODE] ENTER with user_input={user_input!r} pending_entities={state.get('pending_entities')!r}")
     profile = state.get("profile", {})
     # 从 session memory 恢复的 pending_entities（在上轮写回的）
     pending_entities = state.get("pending_entities") or {}
@@ -288,13 +312,18 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
         "follow_up_questions": [],
         "waiting_info": None,
         "long_memory": state.get("long_memory"),
+        "recent_turns": state.get("recent_turns"),
     }
 
     subgraph = _get_planning_subgraph()
     result = subgraph.invoke(subgraph_state)
 
-    # 子图返回的 pending_entities（可能是累积后的）写回 session memory
-    subgraph_pending = result.get("pending_entities") or pending_entities
+    # 子图返回的 pending_entities 写回 session memory
+    # 用 key 存在性判断而非 truthy，避免 None 被 or 回退到旧值
+    if "pending_entities" in result:
+        subgraph_pending = result["pending_entities"]
+    else:
+        subgraph_pending = pending_entities
     status = result.get("status", "")
 
     # need_info 场景必须保留 pending_intent，确保下一轮继续走 planning，而不是重新意图分类

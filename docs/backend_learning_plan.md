@@ -181,7 +181,7 @@ pending_entities 收集完毕 → 生成训练计划
 </details>
 
 **问题 2**：`save_long_memory()` 用了 `tmp_path + replace` 策略。这解决了什么问题？解决不了什么问题？
-
+`tmp_path + replace`好像是把当前用户长期记忆的mardown文件的快照读出来，然后修改后写入。并且保证了这个过程是原子性一次完成的，避免并发写入的冲突❌，是这样吗？
 <details>
 <summary>提问目的</summary>
 

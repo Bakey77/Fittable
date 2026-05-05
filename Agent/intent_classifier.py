@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from backend.services.llm import get_llm
+from backend.services.llm import get_longcat_llm
 
 
 # =============================================================================
@@ -82,7 +82,9 @@ INTENT_KEYWORDS = {
     "training_plan": {
         "strong": [
             "计划", "安排", "一周", "4周", "周期",
-            "训练表", "训练安排", "每天练什么"
+            "训练表", "训练安排", "每天练什么",
+            "减脂","增肌","新手入门","塑形"
+            
         ],
         "medium": [
             "增肌计划", "减脂计划", "新手计划",
@@ -109,9 +111,9 @@ INTENT_KEYWORDS = {
 # =============================================================================
 ENTITY_SCHEMA = {
     "training_plan": {
-        "goal": 0.4,        # 核心字段
-        "duration": 0.4,    # 带时间单位
-        "frequency": 0.2    # 每次/每周
+        "goal": 0.5,        # 核心字段
+        "duration": 0.3,    # 带时间单位
+        "frequency": 0.3    # 每次/每周
     },
     "diet_analysis": {
         "food": 0.4,        # 核心字段
@@ -145,19 +147,66 @@ SECONDARY_THRESHOLD = 0.5  # 次意图阈值
 
 
 # =============================================================================
+# 意图词 / 目标词分离配置
+# 意图词：表达用户要什么类型的回答（answer type），优先级最高
+# 目标词：表达用户的健身目标（fitness goal），次优先级
+# =============================================================================
+# 意图词列表：这些词命中表示用户要某个类型的回答，而非仅仅表达目标
+INTENT_KEYWORDS_ONLY = {
+    # training_guidance：请求动作指导/技术细节
+    "training_guidance": [
+        "怎么做", "如何做", "发力", "姿势", "动作要领",
+        "注意什么", "怎么练", "动作指导", "动作技巧",
+        "怎么发力", "怎么蹲", "怎么推", "怎么拉",
+        "关节", "肌肉", "核心", "拉伸", "热身"
+    ],
+    # meal_planning：请求食谱/餐食安排
+    "meal_planning": [
+        "吃", "食谱", "菜单", "早餐", "午餐", "晚餐",
+        "三餐", "加餐", "饮食", "做饭", "烹饪",
+        "推荐吃", "吃什么", "怎么吃", "怎么搭配"
+    ],
+    # training_plan：请求训练安排/计划表（不含目标词）
+    "training_plan": [
+        "计划", "安排", "训练表", "每周练", "每天练",
+        "一周", "4周", "周期", "日程", "课表"
+    ],
+    # diet_analysis：请求营养数据/计算
+    "diet_analysis": [
+        "多少", "几克", "几卡", "热量", "蛋白质",
+        "脂肪", "碳水", "卡路里", "营养成分", "含量"
+    ],
+}
+
+GOAL_KEYWORDS = {
+    "training_plan": ["增肌", "减脂", "新手入门", "塑形"],
+    "meal_planning": ["减脂餐", "增肌餐", "高蛋白", "低脂", "低碳"],
+}
+
+
+# =============================================================================
 # 工具函数：计算关键词得分
 # =============================================================================
 def compute_keyword_score(text: str, intent_type: str) -> float:
     """
-    根据文本中命中的关键词计算得分
+    两阶段得分：
+    1. 意图词命中（INTENT_KEYWORDS_ONLY）→ 直接返回 1.0，意图词优先级最高
+    2. 目标词命中（GOAL_KEYWORDS）→ 返回 0.6
+    3. 其余走原 strong/medium/weak 链路
 
-    Args:
-        text: 用户原始输入
-        intent_type: 意图类型
-
-    Returns:
-        0-1 之间的得分
+    意图词命中压制目标词命中，体现"用户要什么类型的回答"优先于"用户的健身目标"
     """
+    # 阶段1：意图词命中 → 已禁用，改为融入阶段3的 strong 词中
+    # if intent_type in INTENT_KEYWORDS_ONLY:
+    #     if any(kw in text for kw in INTENT_KEYWORDS_ONLY[intent_type]):
+    #         return 1.0
+
+    # 阶段2：目标词命中（goal 次优先级）
+    if intent_type in GOAL_KEYWORDS:
+        if any(kw in text for kw in GOAL_KEYWORDS[intent_type]):
+            return 0.6
+
+    # 阶段3：原有 strong/medium/weak 链路（兜底）
     config = INTENT_KEYWORDS.get(intent_type, {})
     score = 0.0
 
@@ -288,7 +337,7 @@ class IntentClassifier:
         root = Path(__file__).resolve().parents[1]
         prompt_file = Path(prompt_path) if prompt_path else root / "意图分类 Prompt v2.md"
         self.prompt_template = prompt_file.read_text(encoding="utf-8")
-        self.llm = llm or get_llm()
+        self.llm = llm or get_longcat_llm()
 
     def classify(self, user_input: str) -> dict[str, Any]:
         """

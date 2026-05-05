@@ -17,6 +17,7 @@ Workout Agent LangGraph Workflow
 """
 from typing import Literal
 import sys
+import logging
 from pathlib import Path
 
 try:
@@ -44,14 +45,16 @@ else:
     from .nodes.meal_planning_node import meal_planning_node
     from .nodes.general_conversation_node import general_conversation_node
 
+logger = logging.getLogger(__name__)
+
 # 短期记忆模块
 from .memory import (
     get_session_memory,
     append_turn,
     update_working_memory,
     trim_and_summarize,
+    update_metadata,
     get_recent_turns,
-    get_memory_summary,
     get_working_memory,
 )
 
@@ -98,6 +101,7 @@ def _route_pending_or_intent(state: AgentState) -> str:
     - 目标节点名
     """
     pending_intent = state.get("pending_intent")
+    print(f"[ROUTE] pending_intent={pending_intent!r}, primary_intent={state.get('primary_intent')!r}")
     if pending_intent:
         if pending_intent == "training_plan":
             return "planning_node"
@@ -114,9 +118,202 @@ def _route_pending_or_intent(state: AgentState) -> str:
     return _route_by_intent(state)
 
 
-def _should_skip_intent_classifier(state: AgentState) -> bool:
-    """如果 pending_intent 存在，跳过 intent_classifier，直接路由到 pending 节点"""
-    return bool(state.get("pending_intent"))
+def _entry_router(state: AgentState) -> str:
+    """入口路由：pending_intent 存在时跳过 intent_classifier，直接到目标节点。
+
+    这避免了两个问题：
+    1. 每次多轮追问都浪费一次 LLM 调用做意图分类
+    2. 单字/短输入（如"2天"）被分类器误判为 general，覆盖 pending_intent 路由
+    """
+    pending_intent = state.get("pending_intent")
+    chosen = "intent_classifier"
+    if pending_intent:
+        chosen = pending_intent
+    print(f"[ENTRY-ROUTER] pending_intent={pending_intent!r} → routing to: {chosen}")
+    if pending_intent:
+        if pending_intent == "training_plan":
+            return "planning_node"
+        elif pending_intent == "training_guidance":
+            return "guidance_node"
+        elif pending_intent == "diet_analysis":
+            return "diet_analysis_node"
+        elif pending_intent == "meal_planning":
+            return "meal_planning_node"
+        elif pending_intent == "general":
+            return "general_conversation_node"
+    return "intent_classifier"
+
+
+# =============================================================================
+# 多意图执行计划构建器
+# =============================================================================
+SECONDARY_CONFIDENCE_THRESHOLD = 0.5
+
+
+def _build_execution_plan(state: AgentState) -> list[dict]:
+    """
+    根据意图分类结果构建有序执行计划。
+
+    参数:
+    - state: 含 primary_intent、intents 的 workflow state
+
+    输出:
+    - 有序执行计划数组:
+      [
+        {"intent": "training_plan", "role": "primary"},
+        {"intent": "training_guidance", "role": "secondary"}
+      ]
+    规则:
+    - secondary 只能来自 intents top2 中的第2个
+    - secondary 置信度需 >= 0.5
+    - secondary 与 primary 相同则去重
+    - primary 为 general 时默认不执行 secondary
+    """
+    primary_intent = state.get("primary_intent")
+    intents: list[dict] = state.get("intents", [])
+
+    plan: list[dict] = []
+    if not primary_intent:
+        return plan
+
+    plan.append({"intent": primary_intent, "role": "primary"})
+
+    # 仅当 primary 不是 general 时才考虑 secondary
+    if primary_intent == "general":
+        return plan
+
+    # 从 intents 中找第2个意图作为 secondary
+    if len(intents) >= 2:
+        candidate = intents[1]
+        sec_type = candidate.get("type")
+        sec_conf = candidate.get("confidence", 0)
+        if (
+            sec_type
+            and sec_type != primary_intent
+            and sec_conf >= SECONDARY_CONFIDENCE_THRESHOLD
+        ):
+            plan.append({"intent": sec_type, "role": "secondary"})
+
+    return plan
+
+
+# =============================================================================
+# 节点输出标准化 Adapter
+# =============================================================================
+def _normalize_node_output(raw: dict, intent: str) -> dict:
+    """
+    将各节点的异构输出统一为标准格式，减少聚合器 if-else 拼接。
+
+    输入: 节点原始返回 dict + 对应的 intent 类型
+    输出: {
+        "intent": str,
+        "status": str,
+        "payload": str,               # 主要文本输出
+        "follow_up_questions": list,
+        "waiting_info": dict | None,
+        "pending_intent": str | None,
+        "pending_entities": dict | None,
+        "metadata": dict,
+    }
+    """
+    normalized: dict = {
+        "intent": intent,
+        "status": raw.get("status", "success"),
+        "payload": "",
+        "follow_up_questions": raw.get("follow_up_questions") or [],
+        "waiting_info": raw.get("waiting_info"),
+        "pending_intent": raw.get("pending_intent"),
+        "pending_entities": raw.get("pending_entities"),
+        "metadata": raw.get("metadata") or {},
+    }
+
+    # 根据意图类型提取 payload
+    if intent == "training_guidance":
+        normalized["payload"] = raw.get("guidance", "")
+    elif intent == "training_plan":
+        normalized["payload"] = raw.get("plan", {})
+    elif intent == "diet_analysis":
+        normalized["payload"] = raw.get("analysis_result", "")
+    elif intent == "meal_planning":
+        normalized["payload"] = raw.get("analysis_result", "")
+    elif intent == "general":
+        normalized["payload"] = raw.get("general_response", "")
+
+    return normalized
+
+
+# intent → node function 映射（用于 secondary 直接调用）
+_INTENT_NODE_MAP = {
+    "training_guidance": guidance_node,
+    "training_plan": planning_node,
+    "diet_analysis": diet_analysis_node,
+    "meal_planning": meal_planning_node,
+    "general": general_conversation_node,
+}
+
+
+# =============================================================================
+# 多意图响应聚合器
+# =============================================================================
+def _merge_multi_intent_outputs(
+    primary_result: dict,
+    secondary_result: dict | None,
+    execution_plan: list[dict],
+) -> dict:
+    """
+    合并主次意图输出，保持向后兼容。
+
+    参数:
+    - primary_result: 主意图节点的原始返回 dict（非标准化）
+    - secondary_result: 次意图标准化输出 或 None
+    - execution_plan: _build_execution_plan 的输出
+
+    返回:
+    - 合并后的 result dict，顶层字段保持主意图内容，
+      新增 primary_output / secondary_output / multi_intent
+    """
+    if not secondary_result:
+        # 无次意图：只加 multi_intent 标记，其余原样返回
+        primary_result["primary_output"] = dict(primary_result)
+        primary_result["secondary_output"] = None
+        primary_result["multi_intent"] = {
+            "enabled": False,
+            "executed": [p["intent"] for p in execution_plan],
+            "supplement_note": "",
+        }
+        return primary_result
+
+    # 有次意图：构建多意图响应
+    executed_intents = [p["intent"] for p in execution_plan]
+
+    # 判断是否有 fallback（主意图失败）
+    fallback_used = primary_result.get("status") not in ("success", "need_info") and bool(secondary_result.get("payload"))
+    if fallback_used:
+        if "metadata" not in primary_result:
+            primary_result["metadata"] = {}
+        primary_result["metadata"]["fallback_used"] = True
+
+    # 次意图补充说明
+    sec_intent = secondary_result["intent"]
+    supplement_note = f"已补充执行次意图「{sec_intent}」，详见 secondary_output"
+
+    # 如果次意图有 follow_up_questions，追加到主意图追问尾部
+    sec_follow_ups = secondary_result.get("follow_up_questions") or []
+    if sec_follow_ups:
+        existing_follow_ups = primary_result.get("follow_up_questions") or []
+        primary_result["follow_up_questions"] = list(existing_follow_ups) + [
+            f"[{sec_intent}] {q}" for q in sec_follow_ups
+        ]
+
+    primary_result["primary_output"] = dict(primary_result)
+    primary_result["secondary_output"] = dict(secondary_result)
+    primary_result["multi_intent"] = {
+        "enabled": True,
+        "executed": executed_intents,
+        "supplement_note": supplement_note,
+    }
+
+    return primary_result
 
 
 def build_workflow():
@@ -142,8 +339,18 @@ def build_workflow():
     workflow.add_node("meal_planning_node", meal_planning_node)
     workflow.add_node("general_conversation_node", general_conversation_node)
 
-    # 设置入口点：直接进入 intent_classifier
-    workflow.set_entry_point("intent_classifier")
+    # 条件入口：有 pending_intent 时跳过意图分类器，直达目标节点
+    workflow.set_conditional_entry_point(
+        _entry_router,
+        {
+            "planning_node": "planning_node",
+            "guidance_node": "guidance_node",
+            "diet_analysis_node": "diet_analysis_node",
+            "meal_planning_node": "meal_planning_node",
+            "general_conversation_node": "general_conversation_node",
+            "intent_classifier": "intent_classifier",
+        }
+    )
 
     # intent_classifier → 条件边：先检查 pending_intent，有则跳到对应节点
     workflow.add_conditional_edges(
@@ -240,6 +447,7 @@ def run_workflow(
     #    数据去向: initial_state.waiting_info/pending_*
     # -----------------------------------------------------------------
     working_memory = get_working_memory(session_id)
+    print(f"[MEMORY-READ] session={session_id} pending_intent={working_memory.get('pending_intent')!r} pending_entities={working_memory.get('pending_entities')!r}")
 
     if waiting_info is None:
         waiting_info = working_memory.get("waiting_info")
@@ -249,9 +457,8 @@ def run_workflow(
         pending_entities = working_memory.get("pending_entities")
 
     # 2) 读取上下文短期记忆
-    #    数据来源: session_memory(memory_summary/recent_turns)
-    #    数据去向: initial_state.memory_summary/recent_turns
-    memory_summary = get_memory_summary(session_id)
+    #    数据来源: session_memory(recent_turns)
+    #    数据去向: initial_state.recent_turns
     recent_turns = get_recent_turns(session_id)
 
     # 读取长期记忆（markdown 格式，用于注入 prompt）
@@ -267,7 +474,6 @@ def run_workflow(
         "pending_intent": pending_intent,
         "pending_entities": pending_entities,
         "session_id": session_id,
-        "memory_summary": memory_summary or None,
         "recent_turns": recent_turns or [],
         "long_memory": long_memory_md,
         "retrieved_content": "",
@@ -279,14 +485,83 @@ def run_workflow(
         "metadata": {},
     }
 
-    # 3) 执行工作流
+    # 3) 执行工作流（主意图）
     #    输入: initial_state
     #    输出: result
     result = workflow.invoke(initial_state)
 
     # -----------------------------------------------------------------
+    # 3.5) 多意图并行执行：主意图完成后，条件执行次意图
+    # -----------------------------------------------------------------
+    execution_plan = _build_execution_plan(result)
+    secondary_result = None
+    secondary_node_raw = None
+
+    if len(execution_plan) >= 2:
+        sec_intent = execution_plan[1]["intent"]
+        sec_node_fn = _INTENT_NODE_MAP.get(sec_intent)
+
+        if sec_node_fn:
+            primary_status = result.get("status", "")
+
+            # need_info: 跳过次意图，避免上下文分裂
+            if primary_status == "need_info":
+                print(f"[MULTI-INTENT] 主意图 {result.get('primary_intent')} 需要追问，跳过次意图 {sec_intent}")
+
+            elif primary_status == "success":
+                # 构建次意图的上下文 state
+                sec_state = dict(initial_state)
+                sec_state["primary_intent"] = sec_intent
+                # 次意图不继承 pending 状态，防止污染主流程
+                sec_state["pending_intent"] = None
+                sec_state["pending_entities"] = None
+                sec_state["waiting_info"] = None
+                try:
+                    secondary_node_raw = sec_node_fn(sec_state)
+                    secondary_result = _normalize_node_output(secondary_node_raw, sec_intent)
+                    # 清除次意图返回的 pending/waiting，不污染主流程状态机
+                    secondary_result["pending_intent"] = None
+                    secondary_result["pending_entities"] = None
+                    secondary_result["waiting_info"] = None
+                    print(f"[MULTI-INTENT] 次意图 {sec_intent} 执行成功")
+                except Exception as e:
+                    print(f"[MULTI-INTENT] 次意图 {sec_intent} 执行失败: {e}")
+                    secondary_result = {
+                        "intent": sec_intent,
+                        "status": "error",
+                        "payload": "",
+                        "follow_up_questions": [],
+                        "waiting_info": None,
+                        "pending_intent": None,
+                        "pending_entities": None,
+                        "metadata": {"error": str(e)},
+                    }
+
+            else:
+                # primary status 为 error 或其他：降级尝试次意图
+                print(f"[MULTI-INTENT] 主意图 {result.get('primary_intent')} status={primary_status}，降级尝试次意图 {sec_intent}")
+                sec_state = dict(initial_state)
+                sec_state["primary_intent"] = sec_intent
+                sec_state["pending_intent"] = None
+                sec_state["pending_entities"] = None
+                sec_state["waiting_info"] = None
+                try:
+                    secondary_node_raw = sec_node_fn(sec_state)
+                    secondary_result = _normalize_node_output(secondary_node_raw, sec_intent)
+                    secondary_result["pending_intent"] = None
+                    secondary_result["pending_entities"] = None
+                    secondary_result["waiting_info"] = None
+                    # fallback 标记在 _merge_multi_intent_outputs 中设置
+                except Exception as e:
+                    print(f"[MULTI-INTENT] 次意图降级也失败: {e}")
+                    secondary_result = None
+
+    # 合并主次意图输出（始终执行，单意图也需设置 multi_intent 标记）
+    result = _merge_multi_intent_outputs(result, secondary_result, execution_plan)
+
+    # -----------------------------------------------------------------
     # 4) 结果写回层：写回短期记忆
-    #    数据来源: user_input + result
+    #    数据来源: user_input + result（仅主意图的 pending/waiting 字段）
     #    数据去向: session_memory(recent_turns/working_memory)
     # -----------------------------------------------------------------
     # 追加用户输入
@@ -312,31 +587,46 @@ def run_workflow(
         append_turn(session_id, "assistant", f"[follow_up] {'; '.join(result['follow_up_questions'])}")
         _increment_total_turns(session_id)
 
-    # 更新 working_memory
-    # 规则：只有当节点显式返回非 None 值时才覆盖 working_memory
-    # None 值表示"不更新"，保留旧值
-    next_waiting_info = result.get("waiting_info")
-    next_pending_intent = result.get("pending_intent")
-    next_pending_entities = result.get("pending_entities")
+    # 次意图摘要（可选，简短）
+    if result.get("multi_intent", {}).get("enabled") and result.get("secondary_output"):
+        sec = result["secondary_output"]
+        sec_intent = sec.get("intent", "")
+        sec_payload = sec.get("payload", "")
+        if isinstance(sec_payload, str) and sec_payload:
+            sec_summary = sec_payload[:80] + "..." if len(sec_payload) > 80 else sec_payload
+            append_turn(session_id, "assistant", f"[secondary:{sec_intent}] {sec_summary}")
+            _increment_total_turns(session_id)
 
-    if next_waiting_info is None and "waiting_info" not in result:
-        next_waiting_info = working_memory.get("waiting_info")
-    if next_pending_intent is None and "pending_intent" not in result:
-        next_pending_intent = working_memory.get("pending_intent")
-    if next_pending_entities is None and "pending_entities" not in result:
-        next_pending_entities = working_memory.get("pending_entities")
+    # 更新 working_memory（字段级 KEEP/CLEAR/SET，并发安全）
+    # KEEP: 节点未返回该字段 → Lua 内保留 Redis 当前值
+    # CLEAR: 节点显式返回 None → 清空
+    # SET: 节点返回非 None 值 → 写入新值
+    def _op(key: str) -> tuple[str, object]:
+        if key not in result:
+            return "KEEP", None
+        val = result[key]
+        return ("CLEAR", None) if val is None else ("SET", val)
+
+    wi_op, wi_val = _op("waiting_info")
+    pi_op, pi_val = _op("pending_intent")
+    pe_op, pe_val = _op("pending_entities")
+
+    print(f"[MEMORY-WRITE] session={session_id} pi_op={pi_op} pi_val={pi_val!r} pe_op={pe_op} pe_val_keys={list(pe_val.keys()) if isinstance(pe_val, dict) else pe_val!r}")
 
     update_working_memory(
         session_id,
-        waiting_info=next_waiting_info,
-        pending_intent=next_pending_intent,
-        pending_entities=next_pending_entities,
+        waiting_info_op=wi_op,
+        waiting_info=wi_val,
+        pending_intent_op=pi_op,
+        pending_intent=pi_val,
+        pending_entities_op=pe_op,
+        pending_entities=pe_val,
     )
 
     # -----------------------------------------------------------------
     # 5) 记忆维护层：裁剪长度
     #    数据来源: session_memory.recent_turns
-    #    数据去向: session_memory.memory_summary + 新 recent_turns
+    #    数据去向: session_memory.recent_turns
     # -----------------------------------------------------------------
     try:
         trim_and_summarize(session_id, max_turns=10)
@@ -360,6 +650,9 @@ def run_workflow(
 
     lm_result = update_if_needed(session_id, recent_turns, latest_entities, latest_intent)
     if lm_result.get("triggered"):
+        print(f"[LONG_MEMORY] triggered session={session_id} success={lm_result.get('success')} warning={lm_result.get('warning')!r}")
+        if not lm_result.get("success"):
+            logger.error(f"[LONG_MEMORY] Update FAILED for session={session_id}: warning={lm_result.get('warning')}")
         if lm_result.get("conflicts"):
             result["conflicts"] = lm_result["conflicts"]
             result["conflict_notice"] = lm_result.get("conflict_notice")
@@ -373,16 +666,10 @@ def run_workflow(
 
 def _increment_total_turns(session_id: str) -> None:
     """
-    递增 session memory 中的 total_turns 计数器。
+    递增 session memory 中的 total_turns 计数器（原子操作）。
     该计数器用于长期记忆触发判断，不受 trim_and_summarize 影响。
     """
-    from .memory import session_memory
-
-    full = session_memory.get_session_memory(session_id)
-    if "metadata" not in full:
-        full["metadata"] = {}
-    full["metadata"]["total_turns"] = full["metadata"].get("total_turns", 0) + 1
-    session_memory._save_memory(session_id, full)
+    update_metadata(session_id, "increment_total_turns")
 
 
 if __name__ == "__main__":
