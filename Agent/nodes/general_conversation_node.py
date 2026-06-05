@@ -1,5 +1,6 @@
 """一般对话节点 - 处理 general 意图"""
 import sys
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from backend.services.llm import get_longcat_llm
+
+logger = logging.getLogger(__name__)
 
 
 def general_conversation_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -26,16 +29,25 @@ def general_conversation_node(state: dict[str, Any]) -> dict[str, Any]:
     - status: success
     - follow_up_questions: 追问提示（引导用户回到健身话题）
     """
+    trace_id = state.get("trace_id", "unknown")
     user_input = state.get("user_input", "")
+    logger.info(f"[trace={trace_id}] general_conversation_node start")
     recent_turns = state.get("recent_turns") or []
     long_memory = state.get("long_memory")
     pending_intent = state.get("pending_intent")
     pending_entities = state.get("pending_entities")
+    session_id = state.get("session_id", "")
+
+    from tools.retriever1 import get_formatted_historical_events
 
     # 组装完整上下文（不裁剪）
     context_parts = []
     if long_memory:
         context_parts.append(f"【长期记忆 - 用户持久档案】\n{long_memory}")
+    if session_id:
+        hist = get_formatted_historical_events(user_input, session_id, recent_turns)
+        if hist:
+            context_parts.append(hist)
     if recent_turns:
         context_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
             f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
@@ -68,8 +80,10 @@ def general_conversation_node(state: dict[str, Any]) -> dict[str, Any]:
     if recent_turns:
         follow_up = "关于之前的训练计划或对话内容，你还有什么想了解的吗？\n- 需要调整训练安排吗\n- 有其他健身问题吗"
 
-    return {
+    result = {
         "general_response": answer.strip(),
         "status": "success",
         "follow_up_questions": [follow_up],
     }
+    logger.info(f"[trace={trace_id}] general_conversation_node done: status={result['status']}")
+    return result

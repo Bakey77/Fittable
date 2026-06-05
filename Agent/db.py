@@ -101,6 +101,29 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_log(session_id,created_at);
+
+        CREATE TABLE IF NOT EXISTS historical_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_turns TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_historical_events_session ON historical_events(session_id,created_at);
+
+        CREATE TABLE IF NOT EXISTS historical_event_sync_jobs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sync_jobs_status ON historical_event_sync_jobs(status);
         """
     )
     conn.commit()
@@ -144,6 +167,10 @@ def upsert_attribute(session_id:str,category:str,key:str,value:str)->None:
     插入或更新一个属性 category: preference | constraint
     """
     conn = _get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO user_profile(session_id) VALUES (?)",
+        (session_id,)
+    )
     conn.execute(
         """
         INSERT INTO user_attributes (session_id,category,key,value)
@@ -197,6 +224,30 @@ def get_conflicts(session_id:str,limit:int = 20) -> list[dict]:
     ).fetchall()
     return [dict(r) for r in rows]
 
+
+def get_session_last_updated(session_id: str) -> Optional[str]:
+    """
+    获取一个 session 在长期记忆相关表中的最近更新时间。
+    优先使用真实 updated_at / created_at，而不是读取时生成时间。
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        """
+        SELECT MAX(ts) AS last_updated
+        FROM (
+            SELECT updated_at AS ts FROM user_profile WHERE session_id = ?
+            UNION ALL
+            SELECT updated_at AS ts FROM user_attributes WHERE session_id = ?
+            UNION ALL
+            SELECT created_at AS ts FROM conflict_log WHERE session_id = ?
+        )
+        """,
+        (session_id, session_id, session_id)
+    ).fetchone()
+    if not row:
+        return None
+    return row["last_updated"]
+
 #聊天日志
 
 def append_chat_log(session_id:str,role:str,content:str,intent:Optional[str]=None)->None:
@@ -236,6 +287,160 @@ def get_stats()->dict:
         "total_conflicts": conflict_count,
         "db.path": str(DB_PATH)
     }
+
+# ---------------------------------------------------------------------------
+# 历史事件 CRUD
+# ---------------------------------------------------------------------------
+
+def insert_historical_event(session_id: str, content: str, source_turns: list[int] | str) -> int:
+    """
+    插入一条历史事件。
+
+    Args:
+        session_id: 会话标识
+        content: 事件摘要文本
+        source_turns: 来源轮次（list 或 JSON 数组字符串）
+
+    Returns:
+        新插入的 event id (int)
+    """
+    conn = _get_conn()
+    if isinstance(source_turns, list):
+        source_turns = json.dumps(source_turns, ensure_ascii=False)
+    cur = conn.execute(
+        "INSERT INTO historical_events (session_id, content, source_turns) VALUES (?, ?, ?)",
+        (session_id, content, source_turns)
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_historical_events(session_id: str, limit: int = 50) -> list[dict]:
+    """获取指定 session 的历史事件，按时间倒序。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM historical_events WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+        (session_id, limit)
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("source_turns"):
+            try:
+                d["source_turns"] = json.loads(d["source_turns"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result.append(d)
+    return result
+
+
+def count_historical_events(session_id: str) -> int:
+    """统计某个 session 的历史事件数量。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM historical_events WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def prune_old_events(session_id: str, max_events: int = 50) -> list[int]:
+    """
+    裁剪最旧的历史事件，仅保留最新 max_events 条。
+
+    返回被裁剪的 event id 列表（用于同步删除 Qdrant point）。
+    """
+    conn = _get_conn()
+    total = count_historical_events(session_id)
+    if total <= max_events:
+        return []
+
+    to_delete = total - max_events
+    # 选出最旧的 to_delete 条
+    rows = conn.execute(
+        "SELECT id FROM historical_events WHERE session_id = ? ORDER BY created_at ASC LIMIT ?",
+        (session_id, to_delete)
+    ).fetchall()
+    deleted_ids = [r["id"] for r in rows]
+
+    conn.execute(
+        "DELETE FROM historical_events WHERE id IN ({})".format(
+            ",".join("?" for _ in deleted_ids)
+        ),
+        deleted_ids
+    )
+    conn.commit()
+    logger.info(f"[DB] pruned {len(deleted_ids)} old events for session={session_id}")
+    return deleted_ids
+
+
+# ---------------------------------------------------------------------------
+# 同步补偿 (双写失败补偿)
+# ---------------------------------------------------------------------------
+
+def create_sync_job(event_id: int, session_id: str, error: str = "") -> int:
+    """为写入 Qdrant 失败的事件创建补偿任务。"""
+    conn = _get_conn()
+    cur = conn.execute(
+        "INSERT INTO historical_event_sync_jobs (event_id, session_id, status, retry_count, last_error) VALUES (?, ?, 'pending', 0, ?)",
+        (event_id, session_id, error)
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_pending_sync_jobs(limit: int = 20) -> list[dict]:
+    """获取待处理的同步补偿任务。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM historical_event_sync_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_sync_job_done(job_id: int) -> None:
+    """标记补偿任务为完成。"""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE historical_event_sync_jobs SET status='done', updated_at=datetime('now') WHERE id=?",
+        (job_id,)
+    )
+    conn.commit()
+
+
+def mark_sync_job_failed(job_id: int, error: str) -> None:
+    """递增重试计数并记录错误。重试超过 5 次则标记为 failed。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT retry_count FROM historical_event_sync_jobs WHERE id=?", (job_id,)
+    ).fetchone()
+    if not row:
+        return
+    new_count = row["retry_count"] + 1
+    new_status = "failed" if new_count >= 5 else "pending"
+    conn.execute(
+        "UPDATE historical_event_sync_jobs SET retry_count=?, last_error=?, status=?, updated_at=datetime('now') WHERE id=?",
+        (new_count, error, new_status, job_id)
+    )
+    conn.commit()
+
+
+def get_historical_event_by_id(event_id: int) -> dict | None:
+    """通过 ID 获取单条历史事件（用于补偿重试）。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM historical_events WHERE id = ?", (event_id,)
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("source_turns"):
+        try:
+            d["source_turns"] = json.loads(d["source_turns"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return d
+
 
 #模块初始化，import时自动建表
 try:

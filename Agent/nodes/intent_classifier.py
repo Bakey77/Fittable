@@ -1,7 +1,9 @@
 """意图分类节点"""
 from typing import Any
 from .state import AgentState
+import logging
 
+logger = logging.getLogger(__name__)
 
 def intent_classifier_node(state: AgentState) -> AgentState:
     """
@@ -21,9 +23,17 @@ def intent_classifier_node(state: AgentState) -> AgentState:
     - 路由后流向 guidance_node / planning_node / END
     """
     from ..intent_classifier import classify_intent
+    from ..routing import _build_route_context
 
+    trace_id = state.get("trace_id","unknown")
     user_input = state["user_input"]
-    classified = classify_intent(user_input)
+    session_id = state.get("session_id", "")
+    recent_turns = state.get("recent_turns") or []
+    logger.info(f"[trace={trace_id}] intent_classifier start")
+
+    # 组装路由上下文（previous_intent + recent_turns 摘要 + 历史事件）
+    route_context = _build_route_context(session_id, recent_turns)
+    classified = classify_intent(user_input, route_context=route_context)
 
     intents = classified.get("intents", [])
     primary = classified.get("primary_intent")
@@ -35,9 +45,11 @@ def intent_classifier_node(state: AgentState) -> AgentState:
         if intent.get("type") in ("training_plan", "training_guidance"):
             entities = intent.get("entities", {})
             break
-
-    return {
+    result = {
         "intents": intents,
         "primary_intent": primary_intent,
         "entities": entities,
     }
+    logger.info(f"[trace={trace_id}] intent_classifier done: "
+                f"primary={primary_intent}")
+    return result

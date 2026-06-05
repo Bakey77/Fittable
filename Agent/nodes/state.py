@@ -42,6 +42,11 @@ class AgentState(TypedDict):
     recent_turns: list[dict[str, str]] | None  # 最近对话轮次
     long_memory: str | None         # 长期记忆 markdown（持久化存储）
 
+    #链路追踪
+    trace_id: str | None             # 请求级追踪ID
+    route_reason: str                # 路由决策理由（pending_lock/regex_hit/followup_inherit/llm）
+    route_confidence: float          # 路由决策置信度
+
     # 输出
     retrieved_content: str            # 检索到的内容
     guidance: str                     # 动作指导回答

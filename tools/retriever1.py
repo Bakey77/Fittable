@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import Optional
@@ -14,7 +15,10 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import ScrollResult, ScoredPoint
 
-from rank_bm25 import BM25Okapi
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    BM25Okapi = None
 import jieba
 
 from config import Config
@@ -96,6 +100,10 @@ class BM25Retriever:
     def _initialize(self):
         """从 Qdrant 加载文档并构建 BM25 索引"""
         if self._initialized:
+            return
+
+        if BM25Okapi is None:
+            self._initialized = True
             return
 
         # 使用 scroll API 获取所有文档
@@ -463,6 +471,366 @@ class LLMReranker:
         print(f"[LLMReranker] query='{query}' | scored {len(candidates)} candidates, top score={scored[0][0] if scored else 0}")
 
         return reranked[:top_k]
+
+
+class DashScopeReranker:
+    """
+    DashScope 专用 Rerank 模型重排序器
+
+    使用 qwen3-v1-rerank 等专用模型，一次 API 调用完成所有候选排序，
+    替代 LLMReranker 的逐条 LLM 打分方式，延迟和成本大幅降低。
+
+    API 文档：https://help.aliyun.com/zh/model-studio/text-rerank
+    """
+
+    def __init__(self, rerank_top_n: int = 20):
+        self.rerank_top_n = rerank_top_n
+        self.api_key = Config.LLM_API_KEY
+        self.base_url = os.getenv(
+            "RERANK_BASE_URL",
+            "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+        )
+        self.model = Config.RERANK_MODEL or "gte-rerank"
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[RetrievedChunk],
+        top_k: int = 5,
+    ) -> list[RetrievedChunk]:
+        if not candidates:
+            return []
+
+        candidates = candidates[: self.rerank_top_n]
+        documents = [c.text[:1500] for c in candidates]
+
+        try:
+            import requests
+            resp = requests.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "input": {
+                        "query": query,
+                        "documents": documents,
+                    },
+                    "parameters": {
+                        "top_n": min(top_k, len(documents)),
+                    },
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = data["output"]["results"]
+            # results 按 index 和 relevance_score 返回，重排后取 top_k
+            indexed_scores = {r["index"]: r["relevance_score"] for r in results}
+            scored = [
+                (indexed_scores.get(i, 0.0), candidates[i])
+                for i in range(len(candidates))
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            print(
+                f"[DashScopeReranker] query='{query}' | "
+                f"model={self.model} | "
+                f"scored {len(candidates)} candidates, "
+                f"top score={scored[0][0] if scored else 0:.4f}"
+            )
+        except Exception as e:
+            print(f"[DashScopeReranker] Rerank failed: {e}, fallback to RRF order")
+            try:
+                print(f"[DashScopeReranker] Response body: {resp.text}")
+            except Exception:
+                pass
+            scored = [(0.0, c) for c in candidates]
+
+        reranked = [chunk for _, chunk in scored]
+        return reranked[:top_k]
+
+
+# =============================================================================
+# Historical Events Retriever
+# =============================================================================
+
+HISTORICAL_EVENTS_COLLECTION = "historical_events"
+HISTORICAL_EVENTS_TOP_K = 3
+
+
+def _get_historical_qdrant_client() -> QdrantClient:
+    """获取 Qdrant 客户端（historical_events 专用）。"""
+    return QdrantClient(host=Config.QDRANT_HOST, port=int(Config.QDRANT_PORT) if Config.QDRANT_PORT else 6333)
+
+
+def _get_historical_embed_model():
+    """获取 embedding 模型（懒加载）。"""
+    from backend.services.llm import get_embedding_model
+    return get_embedding_model()
+
+
+def ensure_historical_events_collection() -> None:
+    """确保 historical_events collection 存在于 Qdrant（幂等）。"""
+    client = _get_historical_qdrant_client()
+    collections = [c.name for c in client.get_collections().collections]
+    if HISTORICAL_EVENTS_COLLECTION not in collections:
+        from qdrant_client.models import VectorParams, Distance
+        client.create_collection(
+            collection_name=HISTORICAL_EVENTS_COLLECTION,
+            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+        )
+        print(f"[HistoricalEvents] Created Qdrant collection '{HISTORICAL_EVENTS_COLLECTION}'")
+    else:
+        print(f"[HistoricalEvents] Qdrant collection '{HISTORICAL_EVENTS_COLLECTION}' already exists")
+
+
+def ensure_historical_event_in_qdrant(
+    event_id: int,
+    session_id: str,
+    content: str,
+    source_turns: list[int] | None = None,
+    created_at: str = "",
+) -> None:
+    """
+    将一条历史事件写入 Qdrant（幂等 upsert）。
+
+    Args:
+        event_id: SQLite historical_events.id（用作 Qdrant point id）
+        session_id: 会话标识
+        content: 事件文本
+        source_turns: 来源轮次
+        created_at: 创建时间
+    """
+    client = _get_historical_qdrant_client()
+    embed_model = _get_historical_embed_model()
+
+    vector = embed_model.get_text_embedding(content)
+    payload = {
+        "session_id": session_id,
+        "content": content,
+        "source_turns": json.dumps(source_turns or [], ensure_ascii=False),
+        "created_at": created_at,
+    }
+
+    from qdrant_client.models import PointStruct
+    client.upsert(
+        collection_name=HISTORICAL_EVENTS_COLLECTION,
+        points=[
+            PointStruct(
+                id=event_id,
+                vector=list(vector),
+                payload=payload,
+            )
+        ],
+    )
+
+
+def delete_historical_event_from_qdrant(event_id: int) -> None:
+    """从 Qdrant 删除一条历史事件。"""
+    client = _get_historical_qdrant_client()
+    from qdrant_client.models import PointIdsList
+    client.delete(
+        collection_name=HISTORICAL_EVENTS_COLLECTION,
+        points_selector=PointIdsList(points=[event_id]),
+    )
+
+
+class HistoricalEventsRetriever:
+    """
+    历史事件语义检索器。
+
+    通过 Qdrant 向量检索 + session_id filter，找到与当前 query 最相关的历史事件。
+    """
+
+    def __init__(self):
+        self._client: QdrantClient | None = None
+        self._embed_model = None
+
+    @property
+    def client(self) -> QdrantClient:
+        if self._client is None:
+            self._client = _get_historical_qdrant_client()
+        return self._client
+
+    @property
+    def embed_model(self):
+        if self._embed_model is None:
+            self._embed_model = _get_historical_embed_model()
+        return self._embed_model
+
+    def retrieve(
+        self,
+        query: str,
+        session_id: str,
+        top_k: int = HISTORICAL_EVENTS_TOP_K,
+    ) -> list[dict]:
+        """
+        语义检索与 query 最相关的历史事件。
+
+        Args:
+            query: 当前用户输入
+            session_id: 会话标识（强制 filter，隔离不同 session）
+            top_k: 返回数量
+
+        Returns:
+            [{"content": "...", "source_turns": [...], "created_at": "..."}, ...]
+        """
+        try:
+            query_vector = self.embed_model.get_text_embedding(query)
+
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            results = self.client.query_points(
+                collection_name=HISTORICAL_EVENTS_COLLECTION,
+                query=query_vector,
+                limit=top_k,
+                query_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="session_id",
+                            match=MatchValue(value=session_id),
+                        )
+                    ]
+                ),
+                with_payload=True,
+            ).points
+
+            events = []
+            for p in results:
+                payload = p.payload or {}
+                source_turns = []
+                raw_turns = payload.get("source_turns", "[]")
+                if isinstance(raw_turns, str):
+                    try:
+                        source_turns = json.loads(raw_turns)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif isinstance(raw_turns, list):
+                    source_turns = raw_turns
+
+                events.append({
+                    "content": payload.get("content", ""),
+                    "source_turns": source_turns,
+                    "created_at": payload.get("created_at", ""),
+                    "score": getattr(p, "score", 0.0),
+                })
+
+            return events
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"[HistoricalEventsRetriever] Retrieval failed: {e}")
+            return []
+
+
+# 单例
+_historical_retriever: HistoricalEventsRetriever | None = None
+
+
+def get_historical_events_retriever() -> HistoricalEventsRetriever:
+    global _historical_retriever
+    if _historical_retriever is None:
+        _historical_retriever = HistoricalEventsRetriever()
+    return _historical_retriever
+
+
+def _normalize_text(text: str) -> str:
+    """文本规范化：去空白、去标点、去箭头，用于去重比较。"""
+    import re
+    normalized = re.sub(r"\s+", "", text)
+    # 移除中英文标点、箭头等（注意特殊字符需放在末尾避免被解释为范围）
+    normalized = re.sub(r'[.,，。！!？?、：:；;""''「」『』【】()（）…/→↓↑←➜-]', "", normalized)
+    return normalized.lower()
+
+
+def _deduplicate_against_recent_turns(
+    events: list[dict],
+    recent_turns: list[dict] | None,
+) -> list[dict]:
+    """
+    去重：如果历史事件内容与 recent_turns 中的某条高度相似，则去掉该事件。
+    使用文本规范化精确去重兜底。
+    """
+    if not recent_turns:
+        return events
+
+    recent_texts = set()
+    for turn in recent_turns:
+        text = turn.get("text", "")
+        norm = _normalize_text(text)
+        if len(norm) >= 4:  # 太短的文本不去重
+            recent_texts.add(norm)
+
+    filtered = []
+    for event in events:
+        content = event.get("content", "")
+        norm = _normalize_text(content)
+        # 精确规范化匹配
+        if norm in recent_texts:
+            continue
+        # 子串包含检查
+        is_dup = False
+        for rt in recent_texts:
+            if len(norm) >= 8 and len(rt) >= 8:
+                if norm in rt or rt in norm:
+                    is_dup = True
+                    break
+        if not is_dup:
+            filtered.append(event)
+
+    return filtered
+
+
+def get_formatted_historical_events(
+    query: str,
+    session_id: str,
+    recent_turns: list[dict] | None = None,
+    top_k: int = HISTORICAL_EVENTS_TOP_K,
+) -> str:
+    """
+    检索并格式化历史摘要，供节点 prompt 注入使用。
+
+    Returns:
+        格式化后的 markdown 块，如：
+        【长期记忆 - 历史摘要】
+        - [0509] 俯卧撑手腕不适 → 改推胸机
+        如果无相关事件则返回空字符串。
+    """
+    try:
+        retriever = get_historical_events_retriever()
+        events = retriever.retrieve(query, session_id, top_k=top_k)
+
+        if not events:
+            return ""
+
+        # 去重
+        events = _deduplicate_against_recent_turns(events, recent_turns)
+
+        if not events:
+            return ""
+
+        lines = ["【长期记忆 - 历史摘要】"]
+        for e in events:
+            content = e.get("content", "")
+            created_at = e.get("created_at", "")
+            date_prefix = ""
+            if created_at:
+                # 格式化为 MMDD
+                try:
+                    date_prefix = created_at[5:10].replace("-", "")  # "0509"
+                    date_prefix = f"[{date_prefix}] "
+                except Exception:
+                    pass
+            lines.append(f"- {date_prefix}{content}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[HistoricalEvents] Format failed: {e}")
+        return ""
 
 
 def get_hybrid_retriever(collection_name: str) -> HybridRetriever:

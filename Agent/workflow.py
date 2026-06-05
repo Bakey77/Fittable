@@ -18,7 +18,10 @@ Workout Agent LangGraph Workflow
 from typing import Literal
 import sys
 import logging
+import re
 from pathlib import Path
+import uuid
+import time as time_module
 
 try:
     from langgraph.graph import StateGraph, END
@@ -36,6 +39,7 @@ if __package__ in (None, ""):
     from Agent.nodes.guidance import guidance_node
     from Agent.nodes.planning import planning_node
     from Agent.nodes.general_conversation_node import general_conversation_node
+    from Agent.nodes.memory_explain_node import memory_explain_node
 else:
     from .nodes.state import AgentState
     from .nodes.intent_classifier import intent_classifier_node
@@ -44,6 +48,10 @@ else:
     from .nodes.diet_analysis_node import diet_analysis_node
     from .nodes.meal_planning_node import meal_planning_node
     from .nodes.general_conversation_node import general_conversation_node
+    from .nodes.memory_explain_node import memory_explain_node
+
+from Agent.memory.long_memory import should_update_long_memory
+from Agent.worker import enqueue_long_memory_update
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +67,7 @@ from .memory import (
 )
 
 # 长期记忆模块
-from .memory.long_memory import update_if_needed, load_long_memory, render_markdown
+from .memory.long_memory import load_long_memory, render_markdown
 
 
 def _route_by_intent(state: AgentState) -> Literal["guidance_node", "planning_node", "diet_analysis_node", "meal_planning_node", "general_conversation_node", "__end__"]:
@@ -93,55 +101,144 @@ def _route_by_intent(state: AgentState) -> Literal["guidance_node", "planning_no
 
 def _route_pending_or_intent(state: AgentState) -> str:
     """
-    路由决策：
-    - 如果 pending_intent 存在（多轮追问中），直接路由到对应节点，跳过 intent_classifier
-    - 否则，走 intent_classifier → _route_by_intent 的普通路由
+    路由决策（post-classifier 安全网）：
+    - 如果 pending_intent 存在且应继续追问，直接路由到对应节点
+    - 否则，走 _route_by_intent 的普通路由
 
-    输出:
-    - 目标节点名
+    注意：_determine_route 已在入口处做了 pending lock，这里是二次安全网。
     """
     pending_intent = state.get("pending_intent")
     print(f"[ROUTE] pending_intent={pending_intent!r}, primary_intent={state.get('primary_intent')!r}")
-    if pending_intent:
-        if pending_intent == "training_plan":
-            return "planning_node"
-        elif pending_intent == "training_guidance":
-            return "guidance_node"
-        elif pending_intent == "diet_analysis":
-            return "diet_analysis_node"
-        elif pending_intent == "meal_planning":
-            return "meal_planning_node"
-        elif pending_intent == "general":
-            return "general_conversation_node"
+    if pending_intent and _should_continue_pending_slot(state):
+        return _pending_intent_to_node(pending_intent)
 
     # 无 pending_intent，走普通意图分类路由
     return _route_by_intent(state)
 
 
-def _entry_router(state: AgentState) -> str:
-    """入口路由：pending_intent 存在时跳过 intent_classifier，直接到目标节点。
+def _pending_intent_to_node(pending_intent: str) -> str:
+    """将 pending_intent 映射为目标节点名。"""
+    mapping = {
+        "training_plan": "planning_node",
+        "training_guidance": "guidance_node",
+        "diet_analysis": "diet_analysis_node",
+        "meal_planning": "meal_planning_node",
+        "general": "general_conversation_node",
+    }
+    return mapping.get(pending_intent, "intent_classifier")
 
-    这避免了两个问题：
-    1. 每次多轮追问都浪费一次 LLM 调用做意图分类
-    2. 单字/短输入（如"2天"）被分类器误判为 general，覆盖 pending_intent 路由
+
+def _determine_route(state: AgentState) -> str:
+    """
+    入口路由决策（严格优先级顺序）：
+
+    1. Pending State Lock（追问态锁定 — 绝对优先）
+       → 只要 pending_intent 存在且 _should_continue_pending_slot，必须锁定到追问节点
+       → 跳过所有 regex / evidence / followup / LLM 分类
+    2. Strong Regex Match（强触发正则）
+       → 命中 ROUTE_PATTERNS 中的正则 → 直接路由
+    3. Evidence Inquiry（依据追问）
+       → 命中依据追问语义 → memory_explain_node
+    4. Follow-up Confirmation（跟进确认）
+       → 命中确认语义 + previous_intent 存在 → 继承 previous_intent
+    5. LLM Classification（最终兜底）
+       → 前述规则均未命中 → intent_classifier
+    """
+    from .routing import (
+        _regex_route,
+        _is_evidence_inquiry,
+        _is_followup_confirm,
+        _get_previous_intent,
+        log_route_decision,
+    )
+
+    pending_intent = state.get("pending_intent")
+    user_input = (state.get("user_input") or "").strip()
+    session_id = state.get("session_id", "unknown")
+
+    # ---- Priority 1: Pending State Lock (ABSOLUTE) ----
+    # 处于追问态时，绝对锁定当前意图，不允许被任何 regex/confirm/LLM 覆盖
+    if pending_intent and _should_continue_pending_slot(state):
+        node = _pending_intent_to_node(pending_intent)
+        log_route_decision(session_id, user_input, pending_intent, "pending_lock", 1.0)
+        print(f"[ROUTE] pending_lock → {node}")
+        return node
+
+    # ---- Priority 2: Strong Regex Match ----
+    regex_intent, matched_pat = _regex_route(user_input)
+    if regex_intent:
+        from .routing import intent_to_node
+        node = intent_to_node(regex_intent)
+        log_route_decision(session_id, user_input, regex_intent, f"regex_hit:{matched_pat}", 0.95)
+        print(f"[ROUTE] regex_hit intent={regex_intent} pat={matched_pat!r} → {node}")
+        return node
+
+    # ---- Priority 3: Evidence Inquiry ----
+    if _is_evidence_inquiry(user_input):
+        log_route_decision(session_id, user_input, "memory_explain", "evidence_inquiry", 0.90)
+        print(f"[ROUTE] evidence_inquiry → memory_explain_node")
+        return "memory_explain_node"
+
+    # ---- Priority 4: Follow-up Confirmation ----
+    previous_intent = _get_previous_intent(session_id)
+    if previous_intent and _is_followup_confirm(user_input):
+        from .routing import intent_to_node
+        node = intent_to_node(previous_intent)
+        log_route_decision(session_id, user_input, previous_intent, f"followup_inherit:prev={previous_intent}", 0.85)
+        print(f"[ROUTE] followup_inherit prev={previous_intent} → {node}")
+        return node
+
+    # ---- Priority 5: LLM Classification (LAST RESORT) ----
+    log_route_decision(session_id, user_input, "intent_classifier", "llm", 0.0)
+    print(f"[ROUTE] llm_classify → intent_classifier")
+    return "intent_classifier"
+
+
+def _should_continue_pending_slot(state: AgentState) -> bool:
+    """
+    仅当用户输入看起来是在补充缺失字段时，才继续 pending slot-filling。
+    避免“我有什么训练限制”这类新问题被误当成上一轮追问的续答。
     """
     pending_intent = state.get("pending_intent")
-    chosen = "intent_classifier"
-    if pending_intent:
-        chosen = pending_intent
-    print(f"[ENTRY-ROUTER] pending_intent={pending_intent!r} → routing to: {chosen}")
-    if pending_intent:
-        if pending_intent == "training_plan":
-            return "planning_node"
-        elif pending_intent == "training_guidance":
-            return "guidance_node"
-        elif pending_intent == "diet_analysis":
-            return "diet_analysis_node"
-        elif pending_intent == "meal_planning":
-            return "meal_planning_node"
-        elif pending_intent == "general":
-            return "general_conversation_node"
-    return "intent_classifier"
+    if not pending_intent:
+        return False
+
+    # 当前仅对 training_plan 的补槽做严格限制；其他 pending 保持原行为。
+    if pending_intent != "training_plan":
+        return True
+
+    waiting_info = state.get("waiting_info") or {}
+    missing_fields = waiting_info.get("missing") or []
+    if not missing_fields:
+        return True
+
+    user_input = (state.get("user_input") or "").strip()
+    if not user_input:
+        return False
+
+    # 明显是在发起新的解释/回顾问题，而不是补充 goal/frequency。
+    diversion_patterns = [
+        r"我有什么",
+        r"有什么训练限制",
+        r"按我的.*要注意什么",
+        r"需要注意什么",
+        r"器械条件",
+        r"训练限制",
+        r"为什么",
+        r"怎么回事",
+    ]
+    if any(re.search(pattern, user_input) for pattern in diversion_patterns):
+        return False
+
+    if "frequency" in missing_fields:
+        if re.search(r"(?:每周|一周)\s*(?:\d|[一二两三四五六七])\s*(?:练|天)", user_input):
+            return True
+    if "goal" in missing_fields:
+        if re.search(r"(增肌|减脂|新手入门|新手)", user_input):
+            return True
+
+    # 其余情况保守处理：重新走分类，而不是强制续接旧追问。
+    return False
 
 
 # =============================================================================
@@ -338,16 +435,18 @@ def build_workflow():
     workflow.add_node("diet_analysis_node", diet_analysis_node)
     workflow.add_node("meal_planning_node", meal_planning_node)
     workflow.add_node("general_conversation_node", general_conversation_node)
+    workflow.add_node("memory_explain_node", memory_explain_node)
 
-    # 条件入口：有 pending_intent 时跳过意图分类器，直达目标节点
+    # 条件入口：5 级严格优先级路由
     workflow.set_conditional_entry_point(
-        _entry_router,
+        _determine_route,
         {
             "planning_node": "planning_node",
             "guidance_node": "guidance_node",
             "diet_analysis_node": "diet_analysis_node",
             "meal_planning_node": "meal_planning_node",
             "general_conversation_node": "general_conversation_node",
+            "memory_explain_node": "memory_explain_node",
             "intent_classifier": "intent_classifier",
         }
     )
@@ -380,6 +479,9 @@ def build_workflow():
 
     # meal_planning_node → END
     workflow.add_edge("meal_planning_node", END)
+
+    # memory_explain_node → END
+    workflow.add_edge("memory_explain_node", END)
 
     return workflow.compile()
 
@@ -446,6 +548,8 @@ def run_workflow(
     #    数据来源: session_memory
     #    数据去向: initial_state.waiting_info/pending_*
     # -----------------------------------------------------------------
+    trace_id = str(uuid.uuid4())[:8]
+    t_start = time_module.monotonic()
     working_memory = get_working_memory(session_id)
     print(f"[MEMORY-READ] session={session_id} pending_intent={working_memory.get('pending_intent')!r} pending_entities={working_memory.get('pending_entities')!r}")
 
@@ -476,13 +580,17 @@ def run_workflow(
         "session_id": session_id,
         "recent_turns": recent_turns or [],
         "long_memory": long_memory_md,
+        "trace_id": trace_id,
         "retrieved_content": "",
+        "relevant_events": [],  # 历史摘要检索结果
         "guidance": "",
         "plan": {},
         "follow_up_questions": [],
         "status": "",
         "messages": [],
         "metadata": {},
+        "route_reason": "",
+        "route_confidence": 0.0,
     }
 
     # 3) 执行工作流（主意图）
@@ -559,6 +667,10 @@ def run_workflow(
     # 合并主次意图输出（始终执行，单意图也需设置 multi_intent 标记）
     result = _merge_multi_intent_outputs(result, secondary_result, execution_plan)
 
+    # 3.6) 即时同步：将高价值长期事实直接写入 SQLite，
+    #       避免等待批次 LLM 更新期间长期记忆继续显示旧值。
+    _sync_high_value_memory_if_changed(user_input, session_id)
+
     # -----------------------------------------------------------------
     # 4) 结果写回层：写回短期记忆
     #    数据来源: user_input + result（仅主意图的 pending/waiting 字段）
@@ -623,6 +735,13 @@ def run_workflow(
         pending_entities=pe_val,
     )
 
+    # 写回本轮 executed_intent 为 next round 的 previous_intent
+    executed_intent = result.get("primary_intent")
+    if executed_intent:
+        from .routing import _write_previous_intent
+        _write_previous_intent(session_id, executed_intent)
+        print(f"[LAST-INTENT-WRITE] session={session_id} last_intent={executed_intent}")
+
     # -----------------------------------------------------------------
     # 5) 记忆维护层：裁剪长度
     #    数据来源: session_memory.recent_turns
@@ -648,20 +767,268 @@ def run_workflow(
     latest_entities = result.get("entities") or result.get("pending_entities")
     latest_intent = result.get("primary_intent")
 
-    lm_result = update_if_needed(session_id, recent_turns, latest_entities, latest_intent)
-    if lm_result.get("triggered"):
-        print(f"[LONG_MEMORY] triggered session={session_id} success={lm_result.get('success')} warning={lm_result.get('warning')!r}")
-        if not lm_result.get("success"):
-            logger.error(f"[LONG_MEMORY] Update FAILED for session={session_id}: warning={lm_result.get('warning')}")
-        if lm_result.get("conflicts"):
-            result["conflicts"] = lm_result["conflicts"]
-            result["conflict_notice"] = lm_result.get("conflict_notice")
-        if lm_result.get("warning"):
-            if "metadata" not in result:
-                result["metadata"] = {}
-            result["metadata"]["long_memory_warning"] = lm_result["warning"]
+
+
+    if should_update_long_memory(session_id, recent_turns):
+        snapshot = list(recent_turns[-10:])
+        enqueue_long_memory_update(session_id, snapshot)
+
+    elapsed = (time_module.monotonic() - t_start) * 1000
+    logger.info(f"[trace={trace_id}] workflow done: {elapsed: .0f}ms,intent = {result.get('primary_intent')}")
 
     return result
+
+
+def _sync_high_value_memory_if_changed(user_input: str, session_id: str) -> None:
+    """
+    检测用户输入中的高价值长期事实变更，并立即写入 SQLite。
+    只处理规则可稳定识别的字段，批次 LLM 更新继续作为补全器保留。
+    """
+    import re
+    try:
+        from Agent.db import upsert_attribute, upsert_profile
+
+        profile_updates: dict[str, str] = {}
+        attribute_updates: list[tuple[str, str, str]] = []
+
+        # 名字变更：只匹配简短中文名字，避免把问句疑问词写入档案。
+        invalid_name_tokens = {"什么", "啥", "谁", "名字", "姓名"}
+        is_name_question = bool(re.search(r"(什么|啥|谁|哪位|\?|？)", user_input)) and bool(
+            re.search(r"(我叫|叫什么|名字|姓名)", user_input)
+        )
+        name_patterns = [
+            r"我叫\s*([\u4e00-\u9fff]{1,3})(?:[，。,\.!！\s呢吗啊吧呀]|$)",
+            r"我(?:的)?名字(?:现在|已经)?(?:叫|是|改成?[为了]?)\s*[：:]?\s*([\u4e00-\u9fff]{1,3})(?:[，。,\.!！\s呢吗啊吧呀]|$)",
+            r"(?:叫我|called?)\s+([\u4e00-\u9fff]{1,3})(?:[，。,\.!！\s呢吗啊吧呀]|$)",
+        ]
+        if not is_name_question:
+            for pat in name_patterns:
+                m = re.search(pat, user_input)
+                if m:
+                    name = m.group(1).strip().rstrip("。，！,. ")
+                    if name and len(name) <= 10 and name not in invalid_name_tokens:
+                        profile_updates["name"] = name
+                        break
+
+        # 年龄变更："今年X岁" / "我X岁"
+        age_m = re.search(r"(?:今年|我)\s*(\d{1,3})\s*岁", user_input)
+        if age_m:
+            profile_updates["age"] = f"{age_m.group(1)}岁"
+
+        # 身高变更
+        ht_m = re.search(r"(?:身高)\s*(\d{2,3})\s*(?:cm|厘米)?", user_input)
+        if ht_m:
+            profile_updates["height"] = f"{ht_m.group(1)}cm"
+
+        # 体重变更
+        wt_m = re.search(r"(?:体重)\s*(\d{2,3})\s*(?:kg|公斤)?", user_input)
+        if wt_m:
+            profile_updates["weight"] = f"{wt_m.group(1)}kg"
+
+        # 目标变更：只在用户明确表达长期目标时更新。
+        if re.search(r"(不想增肌了|现在要减脂|我要减脂|想减脂|目标是减脂)", user_input):
+            profile_updates["goal"] = "减脂"
+        elif re.search(r"(不想减脂了|现在要增肌|我要增肌|想增肌|目标是增肌)", user_input):
+            profile_updates["goal"] = "增肌"
+        elif re.search(r"(新手入门|刚开始健身|我是新手)", user_input):
+            profile_updates["goal"] = "新手入门"
+
+        # 性别变更
+        gender_m = re.search(r"(?:我是|我)[\s]*(男生|男的|男性|女生|女的|女性)", user_input)
+        if gender_m:
+            g = gender_m.group(1)
+            profile_updates["gender"] = "男" if g in ("男生", "男的", "男性") else "女"
+
+        # 训练频率：覆盖当前 active_plan_facts.frequency
+        freq = None
+        freq_match = re.search(r"(?:每周|一周)\s*(\d)\s*(?:练|天)", user_input)
+        if freq_match:
+            freq = freq_match.group(1)
+        else:
+            cn_match = re.search(r"(?:每周|一周)\s*([一二两三四五六七])\s*(?:练|天)", user_input)
+            if cn_match:
+                cn_map = {"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7"}
+                freq = cn_map.get(cn_match.group(1))
+        if freq:
+            attribute_updates.append(("active_plan_facts", "frequency", freq))
+
+        # 约束：使用稳定 key，避免把原句写成属性名。
+        constraint_patterns = [
+            (r"(腿伤|腿受伤|腿部受伤)", "lower_body_injury", "是"),
+            (r"(膝盖疼|膝盖痛|膝伤)", "knee_pain", "是"),
+            (r"(不能做下肢负重|暂停下肢负重|避免下肢负重)", "avoid_lower_body_loading", "是"),
+            (r"(不能练腿|别安排腿|避免练腿|不要练腿)", "avoid_leg_training", "是"),
+            (r"(不能练胸|别安排胸|避免练胸|不要练胸)", "avoid_chest_training", "是"),
+            (r"(不能练肩|别安排肩|避免练肩|不要练肩)", "avoid_shoulder_training", "是"),
+            (r"(不能练背|别安排背|避免练背|不要练背)", "avoid_back_training", "是"),
+            (r"(不能练手臂|别安排手臂|避免练手臂|不要练手臂)", "avoid_arm_training", "是"),
+            (r"(不能熬夜训练|晚上太晚不能训练|不适合夜训)", "avoid_late_night_training", "是"),
+            (r"(早上不能训练|不适合晨练)", "avoid_early_morning_training", "是"),
+        ]
+        for pattern, key, value in constraint_patterns:
+            if re.search(pattern, user_input):
+                attribute_updates.append(("constraints", key, value))
+
+        time_limit_match = re.search(r"(?:每次|单次)训练(?:时间)?(?:最多|只能|控制在)?\s*(\d{1,3})\s*分钟", user_input)
+        if time_limit_match:
+            attribute_updates.append(("constraints", "session_time_limit_minutes", time_limit_match.group(1)))
+
+        # 器械可用性：正负向都用稳定 key 存，便于计划生成时直接消费。
+        equipment_patterns = [
+            (r"(没有器械|徒手训练|只能徒手)", "constraints", "no_equipment_only", "是"),
+            (r"(没健身房|没有健身房|不能去健身房)", "constraints", "gym_access", "否"),
+            (r"(有健身房|可以去健身房|在健身房练)", "constraints", "gym_access", "是"),
+            (r"(没哑铃|没有哑铃|不能用哑铃)", "constraints", "available_dumbbells", "否"),
+            (r"(有哑铃|可以用哑铃)", "constraints", "available_dumbbells", "是"),
+            (r"(没杠铃|没有杠铃|不能用杠铃)", "constraints", "available_barbell", "否"),
+            (r"(有杠铃|可以用杠铃)", "constraints", "available_barbell", "是"),
+            (r"(没弹力带|没有弹力带|不能用弹力带)", "constraints", "available_resistance_bands", "否"),
+            (r"(有弹力带|可以用弹力带)", "constraints", "available_resistance_bands", "是"),
+            (r"(没跑步机|没有跑步机|不能用跑步机)", "constraints", "available_treadmill", "否"),
+            (r"(有跑步机|可以用跑步机)", "constraints", "available_treadmill", "是"),
+        ]
+        for pattern, category, key, value in equipment_patterns:
+            if re.search(pattern, user_input):
+                attribute_updates.append((category, key, value))
+
+        # 作息约束：尽量只抓明确表达，避免误判。
+        schedule_patterns = [
+            (r"(只能早上训练|只能晨练|只能早晨训练)", "constraints", "preferred_training_time", "morning_only"),
+            (r"(只能晚上训练|只能夜训|只能晚饭后训练)", "constraints", "preferred_training_time", "evening_only"),
+            (r"(午休训练|中午训练)", "constraints", "preferred_training_time", "midday_only"),
+            (r"(作息不规律|经常熬夜)", "constraints", "irregular_schedule", "是"),
+            (r"(周末才能训练|只有周末能练)", "constraints", "weekend_only_training", "是"),
+            (r"(工作日才能训练|只有工作日能练)", "constraints", "weekday_only_training", "是"),
+        ]
+        for pattern, category, key, value in schedule_patterns:
+            if re.search(pattern, user_input):
+                attribute_updates.append((category, key, value))
+
+        # 偏好：优先用 LLM 检测，覆盖正则无法处理的表达（过敏、忌口、口语化等）
+        food_prefs = _detect_food_preferences(user_input)
+        for fp in food_prefs:
+            attribute_updates.append(("preferences", fp["food"], fp["attitude"]))
+
+        if profile_updates:
+            upsert_profile(session_id, profile_updates)
+            print(f"[HIGH-VALUE-SYNC] profile={profile_updates!r}")
+
+        seen_attr_keys: set[tuple[str, str]] = set()
+        for category, key, value in attribute_updates:
+            dedupe_key = (category, key)
+            if dedupe_key in seen_attr_keys:
+                continue
+            upsert_attribute(session_id, category, key, value)
+            seen_attr_keys.add(dedupe_key)
+            print(f"[HIGH-VALUE-SYNC] {category}.{key}={value!r}")
+
+    except Exception as e:
+        print(f"[HIGH-VALUE-SYNC] failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 食物名称去重：将语义相同的食物合并
+# ---------------------------------------------------------------------------
+
+# 食物同义词组：每组第一个为规范名，后续为同义词
+_FOOD_SYNONYM_CANONICAL_MAP: dict[str, str] = {}
+for _canonical, *_synonyms in [
+    ["米饭", "白米饭", "白饭", "大米饭"],
+    ["鸡肉", "鸡胸肉", "鸡腿肉", "鸡翅", "鸡"],
+    ["猪肉", "猪瘦肉", "瘦肉", "五花肉", "猪"],
+    ["牛肉", "牛腩", "肥牛", "牛排", "牛"],
+    ["羊肉", "羊排", "羊腿", "羊"],
+    ["鸡蛋", "蛋", "鸡蛋白", "蛋清"],
+    ["牛奶", "奶", "牛乳"],
+    ["面条", "面", "拉面", "挂面", "白面"],
+    ["面包", "吐司", "全麦面包"],
+    ["鱼", "鱼肉", "鱼类"],
+]:
+    for _name in [_canonical] + _synonyms:
+        _FOOD_SYNONYM_CANONICAL_MAP[_name] = _canonical
+
+
+def _deduplicate_food_prefs(prefs: list[dict]) -> list[dict]:
+    """
+    对检测到的食物偏好做去重：
+    1. 同义词组合并（如 米饭/白米饭 → 米饭）
+    2. 相同 food 合并（保留先出现的 attitude）
+    """
+    if not prefs:
+        return prefs
+
+    merged: dict[str, str] = {}
+    for item in prefs:
+        food = str(item.get("food", "")).strip()
+        attitude = str(item.get("attitude", "")).strip()
+        if not food or not attitude:
+            continue
+        # 映射到规范名
+        canonical = _FOOD_SYNONYM_CANONICAL_MAP.get(food, food)
+        if canonical not in merged:
+            merged[canonical] = attitude
+
+    result = [{"food": k, "attitude": v} for k, v in merged.items()]
+    if len(result) != len(prefs):
+        print(f"[FOOD-PREF-DEDUP] {len(prefs)} → {len(result)}: {prefs} → {result}")
+    return result
+
+
+def _detect_food_preferences(user_input: str) -> list[dict]:
+    """
+    使用 LLM 检测用户输入中的食物偏好。
+
+    覆盖：喜欢/不喜欢/过敏/忌口/习惯等表达，
+    正则无法穷举的口语化偏好（如"海鲜过敏""最近戒糖""鸡胸肉不错"）。
+
+    返回: [{"food": "鸡胸肉", "attitude": "喜欢"}, ...]
+    非偏好表达返回空列表。
+    """
+    try:
+        import json
+        from backend.services.llm import get_longcat_llm
+
+        prompt = f"""判断以下用户输入是否表达了食物偏好（喜欢/不喜欢/过敏/忌口/习惯/不爱吃等）。
+不是偏好就输出空数组 []。
+
+去重规则：语义相同的食物必须合并为一条，只保留最通用的名称。
+- "喜欢米饭和白米饭" → [{{"food": "米饭", "attitude": "喜欢"}}]（白米饭=米饭，合并为米饭）
+- "喜欢吃鸡胸肉和鸡肉" → [{{"food": "鸡肉", "attitude": "喜欢"}}]（鸡胸肉是鸡肉的子类，合并为鸡肉）
+- "喜欢牛肉、牛腩、肥牛" → [{{"food": "牛肉", "attitude": "喜欢"}}]
+
+偏好示例：
+- "我喜欢吃鸡胸肉" → [{{"food": "鸡胸肉", "attitude": "喜欢"}}]
+- "鱼我不要" → [{{"food": "鱼", "attitude": "不喜欢"}}]
+- "海鲜过敏" → [{{"food": "海鲜", "attitude": "过敏"}}]
+- "最近在戒糖" → [{{"food": "糖", "attitude": "忌口"}}]
+- "早餐一般吃燕麦" → [{{"food": "燕麦", "attitude": "习惯"}}]
+- "牛肉面yyds" → [{{"food": "牛肉面", "attitude": "喜欢"}}]
+- "米饭不太想吃" → [{{"food": "米饭", "attitude": "不喜欢"}}]
+- "深蹲怎么做" → []
+- "今天天气怎么样" → []
+
+用户输入：{user_input}
+
+只输出 JSON 数组，不要其他内容。"""
+
+        llm = get_longcat_llm()
+        response = llm.invoke([{"role": "user", "content": prompt}])
+        raw = response.content.strip()
+
+        # 清理可能的 markdown 代码块标记
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        raw = raw.strip()
+
+        result = json.loads(raw)
+        if isinstance(result, list):
+            print(f"[FOOD-PREF-DETECT] detected: {result}")
+            return _deduplicate_food_prefs(result)
+    except Exception as e:
+        print(f"[FOOD-PREF-DETECT] failed: {e}")
+    return []
 
 
 def _increment_total_turns(session_id: str) -> None:

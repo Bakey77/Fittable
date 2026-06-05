@@ -2,8 +2,11 @@
 import os
 import sys
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -150,6 +153,7 @@ def _tavily_search_diet(
     query: str,
     long_memory: str | None = None,
     recent_turns: list | None = None,
+    session_id: str = "",
 ) -> str | None:
     """使用 Tavily 搜索食物营养信息
 
@@ -157,6 +161,7 @@ def _tavily_search_diet(
         query: 用户查询
         long_memory: 长期记忆 markdown
         recent_turns: 短期记忆
+        session_id: 会话标识（用于检索历史摘要）
 
     Returns:
         格式化后的营养信息字符串，失败返回 None
@@ -168,10 +173,15 @@ def _tavily_search_diet(
 
         # 构建提示让 LLM 提取营养信息并格式化为统一格式
         from backend.services.llm import get_longcat_llm
+        from tools.retriever1 import get_formatted_historical_events
 
         mem_parts = []
         if long_memory:
             mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+        if session_id:
+            hist = get_formatted_historical_events(query, session_id, recent_turns)
+            if hist:
+                mem_parts.append(hist)
         if recent_turns:
             mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
                 f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
@@ -222,7 +232,9 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
     流向:
     - 输出回到 workflow 主流程并到 END
     """
+    trace_id = state.get("trace_id", "unknown")
     user_input = state["user_input"]
+    logger.info(f"[trace={trace_id}] diet_analysis_node start")
     long_memory = state.get("long_memory")
     recent_turns = state.get("recent_turns")
 
@@ -235,7 +247,7 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
     # 2. 格式化输出
     if food_results:
         analysis_result = "\n".join(food_results)
-        return {
+        result = {
             "analysis_result": analysis_result,
             "status": "success",
             "metadata": {
@@ -243,20 +255,25 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
                 "count": len(food_results),
             },
         }
+        logger.info(f"[trace={trace_id}] diet_analysis_node done: status={result['status']}, source={result['metadata']['source']}")
+        return result
 
     # 3. food_data 未命中，fallback 到 tavily（注入记忆上下文）
-    tavily_result = _tavily_search_diet(user_input, long_memory, recent_turns)
+    session_id = state.get("session_id", "")
+    tavily_result = _tavily_search_diet(user_input, long_memory, recent_turns, session_id=session_id)
     if tavily_result and tavily_result != "未找到相关营养数据":
-        return {
+        result = {
             "analysis_result": tavily_result,
             "status": "success",
             "metadata": {
                 "source": "tavily",
             },
         }
+        logger.info(f"[trace={trace_id}] diet_analysis_node done: status={result['status']}, source={result['metadata']['source']}")
+        return result
 
     # 4. 两者都未命中
-    return {
+    result = {
         "analysis_result": "",
         "status": "not_found",
         "metadata": {
@@ -266,3 +283,5 @@ def diet_analysis_node(state: dict[str, Any]) -> dict[str, Any]:
             "未在食物数据库或网络搜索中找到相关营养信息，请尝试更具体的食物名称。"
         ],
     }
+    logger.info(f"[trace={trace_id}] diet_analysis_node done: status={result['status']}, source={result['metadata']['source']}")
+    return result

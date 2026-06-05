@@ -1,7 +1,10 @@
 """餐食规划节点"""
+import logging
 from typing import Any
 
 from backend.services.llm import get_longcat_llm
+
+logger = logging.getLogger(__name__)
 
 
 def meal_planning_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -18,13 +21,22 @@ def meal_planning_node(state: dict[str, Any]) -> dict[str, Any]:
     流向:
     - 输出回到 workflow 主流程并到 END
     """
+    trace_id = state.get("trace_id", "unknown")
     user_input = state["user_input"]
+    logger.info(f"[trace={trace_id}] meal_planning_node start")
     long_memory = state.get("long_memory")
     recent_turns = state.get("recent_turns") or []
+    session_id = state.get("session_id", "")
+
+    from tools.retriever1 import get_formatted_historical_events
 
     mem_parts = []
     if long_memory:
         mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+    if session_id:
+        hist = get_formatted_historical_events(user_input, session_id, recent_turns)
+        if hist:
+            mem_parts.append(hist)
     if recent_turns:
         mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
             f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
@@ -46,10 +58,12 @@ def meal_planning_node(state: dict[str, Any]) -> dict[str, Any]:
     response = llm.invoke([{"role": "user", "content": prompt}])
     analysis_result = response.content if hasattr(response, "content") else str(response)
 
-    return {
+    result = {
         "analysis_result": analysis_result.strip(),
         "status": "success",
         "metadata": {
             "source": "meal_planning_node",
         },
     }
+    logger.info(f"[trace={trace_id}] meal_planning_node done: status={result['status']}")
+    return result

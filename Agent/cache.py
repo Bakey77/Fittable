@@ -37,8 +37,11 @@ class RetrievalCache:
         digest = hashlib.md5(q.encode()).hexdigest() #转字节-转哈希-转32位16进制字符串
         return f"fit_agent:cache:retrieval:{digest}"
     
-    def get(self,query:str)->Optional[list[dict]]:
-        """"查缓存，命中返回结果列表，未命中返回None"""
+    def get(self,query:str,use_lock:bool=True)->Optional[list[dict]]:
+        """"
+        查缓存，命中返回结果列表，未命中返回None
+        use_lock=True 时启动分布式锁防击穿
+        """
         client = _get_redis_client()
         if client is None:
             self._misses += 1
@@ -46,12 +49,43 @@ class RetrievalCache:
         
         key = self._cache_key(query)
         data = client.get(key)
-        if data is None:
-            self._misses += 1
-            return None
+
+        if data is not None:
+            self._hits += 1
+            return json.loads(data)
         
-        self._hits += 1
-        return json.loads(data)
+        #缓存未命中 -- 如果启用了锁防护，尝试获取回源锁
+        if use_lock:
+            from Agent.lock import get_cache_lock
+
+            lock = get_cache_lock(query)
+            if lock.acquire():
+                #拿到锁 -- 我负责回源 （调用方负责回源后调set()）
+                #不在这里释放锁。调用方回源+set后再释放
+                #把锁对象存进实例变量，让调用方通过 release_lock() 方法释放
+                self._pending_lock = lock
+                self._misses += 1 #确实是miss了
+                return None
+            
+            #没拿到锁 - 等一会再查缓存
+            for _ in range(5):
+                time.sleep(0.1)
+                data = client.get(key)
+                if data is not None:
+                    self._hits += 1
+                    return json.loads(data)
+        
+        #最终miss 没拿到锁，等了也没等到
+        self._misses += 1
+        return None
+
+    def release_after_backfill(self,query:str)->None:
+        """
+        回源完成并写入缓存后，释放分布式锁（调用方在set()后调用）
+        """
+        if hasattr(self,'_pending_lock') and self._pending_lock:
+            self._pending_lock.release()
+            self._pending_lock = None
     
     def set(self,query:str,results:list[dict],is_empty:bool=False) -> None:
         """"

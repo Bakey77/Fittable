@@ -9,6 +9,7 @@ __all__ = [
     "planning_node",
     "diet_analysis_node",
     "meal_planning_node",
+    "memory_explain_node",
 ]
 
 
@@ -49,4 +50,8 @@ def __getattr__(name: str):
         from .meal_planning_node import meal_planning_node
 
         return meal_planning_node
+    if name == "memory_explain_node":
+        from .memory_explain_node import memory_explain_node
+
+        return memory_explain_node
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

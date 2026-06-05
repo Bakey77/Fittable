@@ -3,6 +3,11 @@ import re
 import sys
 from pathlib import Path
 from typing import Any, Literal
+import logging
+logger = logging.getLogger(__name__)
+
+
+
 
 from langgraph.graph import StateGraph, END
 
@@ -56,10 +61,16 @@ def _extract_positive_int(value: Any) -> int | None:
     return None
 
 
-def _extract_plan_entities_with_llm(user_input: str, long_memory: str | None = None, recent_turns: list | None = None) -> dict[str, Any]:
+def _extract_plan_entities_with_llm(user_input: str, long_memory: str | None = None, recent_turns: list | None = None, session_id: str = "") -> dict[str, Any]:
+    from tools.retriever1 import get_formatted_historical_events
+
     mem_parts = []
     if long_memory:
         mem_parts.append(f"【长期记忆】\n{long_memory}")
+    if session_id:
+        hist = get_formatted_historical_events(user_input, session_id, recent_turns)
+        if hist:
+            mem_parts.append(hist)
     if recent_turns:
         mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
             f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
@@ -115,7 +126,8 @@ def _subgraph_extract(state: PlanningSubgraphState) -> dict:
     user_input = state["user_input"]
     long_memory = state.get("long_memory")
     recent_turns = state.get("recent_turns")
-    extracted = _extract_plan_entities_with_llm(user_input, long_memory, recent_turns)
+    session_id = state.get("session_id", "")
+    extracted = _extract_plan_entities_with_llm(user_input, long_memory, recent_turns, session_id=session_id)
     return {"extracted_entities": extracted}
 
 
@@ -181,9 +193,16 @@ def _subgraph_generate_plan(state: PlanningSubgraphState) -> dict:
     long_memory = state.get("long_memory")
     recent_turns = state.get("recent_turns")
 
+    from tools.retriever1 import get_formatted_historical_events
+
     mem_parts = []
     if long_memory:
         mem_parts.append(f"【长期记忆 - 用户档案】\n{long_memory}")
+    session_id = state.get("session_id", "")
+    if session_id:
+        hist = get_formatted_historical_events(state.get("user_input", ""), session_id, recent_turns)
+        if hist:
+            mem_parts.append(hist)
     if recent_turns:
         mem_parts.append("【短期记忆 - 最近对话】\n" + "\n".join(
             f"- {'用户' if t['role'] == 'user' else '助手'}：{t['text']}"
@@ -295,6 +314,8 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
     输出:
     - plan / status / follow_up_questions / waiting_info / pending_entities
     """
+    trace_id = state.get("trace_id","unknown")
+    logger.info(f"[trace={trace_id}] planning_node start")
     user_input = state["user_input"]
     print(f"[PLANNING-NODE] ENTER with user_input={user_input!r} pending_entities={state.get('pending_entities')!r}")
     profile = state.get("profile", {})
@@ -313,6 +334,7 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
         "waiting_info": None,
         "long_memory": state.get("long_memory"),
         "recent_turns": state.get("recent_turns"),
+        "session_id": state.get("session_id", ""),
     }
 
     subgraph = _get_planning_subgraph()
@@ -333,7 +355,25 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
         # success/error 场景由子图决定（通常为 None，表示清空）
         next_pending_intent = result.get("pending_intent")
 
-    return {
+    # 计划生成成功后，立即同步 Active Plan Facts 到 SQLite
+    # 避免等 10 轮 LLM 更新期间长期记忆仍显示旧计划
+    if status == "success":
+        plan = result.get("plan", {})
+        session_id = state.get("session_id")
+        if plan and session_id:
+            try:
+                from Agent.db import upsert_attribute, upsert_profile
+                goal_map = {"muscle_gain": "增肌", "fat_loss": "减脂", "beginner": "新手入门"}
+                goal_cn = goal_map.get(plan.get("goal"), plan.get("goal"))
+                freq = plan.get("frequency", "")
+                # Active Plan Facts
+                upsert_attribute(session_id, "active_plan_facts", "plan_type", goal_cn)
+                upsert_attribute(session_id, "active_plan_facts", "training_frequency", f"{freq} 天/周")
+                # 同步更新 Stable Profile 的 goal（用户改计划 = 目标变了）
+                upsert_profile(session_id, {"goal": goal_cn})
+            except Exception:
+                pass  # SQLite 同步失败不影响主流程
+    output = {
         "plan": result.get("plan", {}),
         "status": status,
         "follow_up_questions": result.get("follow_up_questions", []),
@@ -341,3 +381,7 @@ def planning_node(state: dict[str, Any]) -> dict[str, Any]:
         "pending_intent": next_pending_intent,
         "pending_entities": subgraph_pending,
     }
+    logger.info(f"[trace={trace_id}] planning_node done: "
+                f"status={status}, goal={output.get('plan', {}).get('goal', 'N/A')}, "
+                f"days={len(output.get('plan', {}).get('plan', []))}")
+    return output

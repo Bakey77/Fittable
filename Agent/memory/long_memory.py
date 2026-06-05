@@ -58,6 +58,39 @@ DEFAULT_TEMPLATE = """# Long-Term Memory
 - 暂无更新
 """
 
+# ---------------------------------------------------------------------------
+# 食物同义词映射（读取时去重用，与 workflow.py 中 _FOOD_SYNONYM_CANONICAL_MAP 保持一致）
+# ---------------------------------------------------------------------------
+_FOOD_CANONICAL: dict[str, str] = {}
+for _canonical, *_synonyms in [
+    ["米饭", "白米饭", "白饭", "大米饭"],
+    ["鸡肉", "鸡胸肉", "鸡腿肉", "鸡翅", "鸡"],
+    ["猪肉", "猪瘦肉", "瘦肉", "五花肉", "猪"],
+    ["牛肉", "牛腩", "肥牛", "牛排", "牛"],
+    ["羊肉", "羊排", "羊腿", "羊"],
+    ["鸡蛋", "蛋", "鸡蛋白", "蛋清"],
+    ["牛奶", "奶", "牛乳"],
+    ["面条", "面", "拉面", "挂面", "白面"],
+    ["面包", "吐司", "全麦面包"],
+    ["鱼", "鱼肉", "鱼类"],
+]:
+    for _name in [_canonical] + _synonyms:
+        _FOOD_CANONICAL[_name] = _canonical
+
+
+def _dedupe_preference_items(items: dict[str, str]) -> dict[str, str]:
+    """对偏好 items 做同义词去重，如 米饭/白米饭 → 米饭。"""
+    if not items:
+        return items
+    merged: dict[str, str] = {}
+    for key, val in items.items():
+        canonical = _FOOD_CANONICAL.get(key, key)
+        if canonical not in merged:
+            merged[canonical] = val
+    if len(merged) != len(items):
+        logger.info(f"[LONG_MEMORY] deduped preferences: {len(items)} → {len(merged)}")
+    return merged
+
 
 # ---------------------------------------------------------------------------
 # 路径管理
@@ -75,41 +108,131 @@ def get_long_memory_path(session_id: str) -> Path:
 
 def load_long_memory(session_id: str) -> dict:
     """
-    加载长期记忆为 dict 对象。
-    文件不存在时返回默认模板解析结果。
+    从SQLite加载长期记忆为dict对象
+    不存在时返回默认模版
     """
-    path = get_long_memory_path(session_id)
-    if not path.exists():
-        return parse_markdown_to_obj(DEFAULT_TEMPLATE)
+    from Agent.db import get_attributes, get_conflicts, get_profile, get_session_last_updated
 
     try:
-        text = path.read_text(encoding="utf-8")
-        return parse_markdown_to_obj(text)
+        profile = get_profile(session_id)
+        attrs = get_attributes(session_id)
+        conflicts = get_conflicts(session_id)
+        last_updated = get_session_last_updated(session_id)
+
+        memory_obj = {}
+
+        #构建与原来markdown解析相同的dict结构（兼容外部调用方）
+        #Stable Profile
+        if profile:
+            items = {k:v for k,v in profile.items()
+                     if k not in ('session_id','created_at','updated_at') and v}
+            raw_lines = [f"- {k}:{v}" for k,v in items.items()]
+            memory_obj["Stable Profile"] = {"raw_lines": raw_lines, "items": items}
+        else:
+            memory_obj["Stable Profile"] = {"raw_lines": ["- 暂无信息"], "items": {}}
+        #Attributes 按 category分组
+        for category,section_name in [
+            ("preferences","Preferences"),
+            ("constraints","Constraints"),
+            ("active_plan_facts","Active Plan Facts"),
+        ]:
+            cat_attrs = [a for a in attrs if a['category'] == category]
+            items = {a["key"]: a["value"] for a in cat_attrs}
+            # 对偏好类做同义词去重（如 米饭/白米饭 → 米饭）
+            if category == "preferences":
+                items = _dedupe_preference_items(items)
+            raw_lines = [f"- {k}: {v}" for k, v in items.items()]
+            if not raw_lines:
+                raw_lines = [f"- 暂无{'偏好' if category == 'preferences' else '约束' if category == 'constraints' else '计划'}"]
+            memory_obj[section_name] = {"raw_lines": raw_lines, "items": items}
+
+        # Conflict Log
+        if conflicts:
+            raw_lines = [
+                f"- [{c['created_at']}] 字段「{c['field_name']}」({c['source']})：{c['old_value']} → {c['new_value']}"
+                for c in conflicts
+            ]
+        else:
+            raw_lines = ["- 暂无冲突"]
+        memory_obj["Conflict Log"] = {"raw_lines": raw_lines, "items": {}}
+
+        # Last Updated 使用真实持久化时间；无持久化记录时回退到默认占位。
+        memory_obj["Last Updated"] = {
+            "raw_lines": [f"- {last_updated}"] if last_updated else ["- 暂无更新"],
+            "items": {"timestamp": last_updated} if last_updated else {},
+        }
+
+        return memory_obj
+
     except Exception as e:
-        logger.warning(f"Failed to load long memory for {session_id}: {e}")
+        logger.warning(f"Failed to load from SQLite for {session_id}: {e}, using default", exc_info=True)
         return parse_markdown_to_obj(DEFAULT_TEMPLATE)
+
+
+    # path = get_long_memory_path(session_id)
+    # if not path.exists():
+    #     return parse_markdown_to_obj(DEFAULT_TEMPLATE)
+
+    # try:
+    #     text = path.read_text(encoding="utf-8")
+    #     return parse_markdown_to_obj(text)
+    # except Exception as e:
+    #     logger.warning(f"Failed to load long memory for {session_id}: {e}")
+    #     return parse_markdown_to_obj(DEFAULT_TEMPLATE)
 
 
 def save_long_memory(session_id: str, memory_obj: dict) -> None:
     """
-    将 memory_obj 渲染为 Markdown 并写入文件。
-    使用 tmp + replace 实现原子写入。
+    保存长期记忆到SQLite
+    自动拆分为 profile 和 attributes 两张表
     """
-    path = get_long_memory_path(session_id)
-    md_text = render_markdown(memory_obj)
+    from Agent.db import upsert_profile, upsert_attribute,append_conflict
 
-    tmp_path = path.with_suffix(".tmp")
     try:
-        tmp_path.write_text(md_text, encoding="utf-8")
-        tmp_path.replace(path)
+        # 1. Stable Profile → user_profile 表
+        profile_section = memory_obj.get("Stable Profile", {}).get("items", {})
+        profile_fields = {}
+        for k in ["name", "gender", "age", "height", "weight", "training_level", "goal"]:
+            if k in profile_section and profile_section[k]:
+                profile_fields[k] = profile_section[k]
+        if profile_fields:
+            upsert_profile(session_id, profile_fields)
+        # 2. Preferences/Constraints/Active Plan Facts → user_attributes 表
+        section_to_category = {
+            "Preferences" : "preferences",
+            "Constraints" : "constraints",
+            "Active Plan Facts" : "active_plan_facts",
+        }
+        for section_name, category in section_to_category.items():
+            section = memory_obj.get(section_name,{}).get("items",{})
+            for key, value in section.items():
+                if value:
+                    upsert_attribute(session_id, category, key, str(value))
+        # 3. Conflict Log → conflict_log 表
+        # 注意：冲突日志在 merge_with_overwrite 中已经追加到 memory_obj，
+        # 这里我们只记录新增的行（简化实现：冲突日志按条追加，不重复的才写入）
+        conflict_section = memory_obj.get("Conflict Log",{}).get("raw_lines",[])
+        # 冲突日志的新增已在 append_conflict_log() 中处理，此处跳过
+        # （直接在 merge 时调用 append_conflict 写入 SQLite）
+
     except Exception as e:
-        logger.warning(f"Failed to save long memory for {session_id}: {e}")
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
+        logger.warning(f"Failed to save long memory to SQLite for {session_id}: {e}",exc_info=True)
+    
+    # path = get_long_memory_path(session_id)
+    # md_text = render_markdown(memory_obj)
+
+    # tmp_path = path.with_suffix(".tmp")
+    # try:
+    #     tmp_path.write_text(md_text, encoding="utf-8")
+    #     tmp_path.replace(path)
+    # except Exception as e:
+    #     logger.warning(f"Failed to save long memory for {session_id}: {e}")
+    #     if tmp_path.exists():
+    #         try:
+    #             tmp_path.unlink()
+    #         except OSError:
+    #             pass
+    #     raise
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +349,10 @@ def detect_conflicts(old_memory: dict, new_facts: dict) -> list[dict]:
         # 收集新值
         new_values = {}
         for key, val in new_section.items():
-            if val and val not in _PLACEHOLDERS:
+            if val:
+                # _PLACEHOLDERS 全是字符串，非字符串（如 list）不可能是占位符，直接通过
+                if isinstance(val, str) and val in _PLACEHOLDERS:
+                    continue
                 new_values[key] = val
 
         # 检测冲突（使用语义相等判断）
@@ -271,7 +397,7 @@ def merge_with_overwrite(old_memory: dict, new_facts: dict) -> tuple[dict, list[
 
 
 def append_conflict_log(memory_obj: dict, conflicts: list[dict]) -> None:
-    """将冲突追加到 Conflict Log。"""
+    """将冲突追加到 Conflict Log。同时写内存对象和SQLite"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     section = memory_obj.get("Conflict Log", {"raw_lines": [], "items": {}})
 
@@ -400,6 +526,26 @@ def _build_section_obj(section: str, raw_lines: list[str]) -> dict:
     return {"raw_lines": raw_lines, "items": items}
 
 
+def _sanitize_profile_updates(updated_sections: dict[str, Any]) -> dict[str, Any]:
+    """
+    对 LLM 产出的 Stable Profile 做最小安全清洗，避免问句词误写入姓名。
+    """
+    if not isinstance(updated_sections, dict):
+        return updated_sections
+    stable = updated_sections.get("Stable Profile")
+    if not isinstance(stable, dict):
+        return updated_sections
+    name_val = stable.get("name")
+    if name_val is None:
+        return updated_sections
+
+    invalid_name_tokens = {"什么", "啥", "谁", "名字", "姓名"}
+    name = str(name_val).strip()
+    if (not name) or (name in invalid_name_tokens) or ("?" in name) or ("？" in name):
+        stable["name"] = None
+    return updated_sections
+
+
 # ---------------------------------------------------------------------------
 # LLM 更新逻辑
 # ---------------------------------------------------------------------------
@@ -446,34 +592,120 @@ def _build_update_prompt(
 请只输出 JSON 格式的更新结果，不要输出其他内容：
 
 {{
-  "updated_sections": {{
-    "Stable Profile": {{
-      "name": "用户姓名或称呼（如有）",
-      "gender": "用户性别（如有）",
-      "age": "用户年龄（如有，保留数字或数字+岁）",
-      "height": "用户身高（如有，保留原单位）",
-      "weight": "用户体重（如有，保留原单位）",
-      "training_level": "训练水平（如有）",
-      "goal": "长期目标（如有）"
+  “updated_sections”: {{
+    “Stable Profile”: {{
+      “name”: “用户姓名或称呼（如有）”,
+      “gender”: “用户性别（如有）”,
+      “age”: “用户年龄（如有，保留数字或数字+岁）”,
+      “height”: “用户身高（如有，保留原单位）”,
+      “weight”: “用户体重（如有，保留原单位）”,
+      “training_level”: “训练水平（如有）”,
+      “goal”: “长期目标（如有）”
     }},
-    "Preferences": {{"key": "value", ...}},
-    "Constraints": {{"key": "value", ...}},
-    "Active Plan Facts": {{"key": "value", ...}}
+    “Preferences”: {{“key”: “value”, ...}},
+    “Constraints”: {{“key”: “value”, ...}},
+    “Active Plan Facts”: {{“key”: “value”, ...}}
   }},
-  "summary": "一句话概括本轮记忆更新内容"
+  “summary”: “一句话概括本轮记忆更新内容”,
+  “historical_events”: [
+    {{
+      “content”: “用1-2句话描述本轮对话中的重要事件，含因果链条。例如：俯卧撑手腕不适 → 建议改用推胸机 → 用户表示尝试”,
+      “source_turns”: [1, 2, 3]
+    }}
+  ]
 }}
 
 要求：
 1. 必须优先提取并更新用户档案字段：name、gender、age、height、weight。
 2. 如果最近对话或当前长期记忆中有这些字段，请在 Stable Profile 中显式输出；没有则输出 null。
-3. 严禁编造用户信息；只能基于“最近10轮对话 + 当前长期记忆 + 本轮实体”更新。
+3. 严禁编造用户信息；只能基于”最近10轮对话 + 当前长期记忆 + 本轮实体”更新。
 4. 冲突时以用户最新明确表达为准（例如年龄、身高、体重更新）。
 5. Preferences 存放用户偏好（如训练偏好、饮食偏好）。
 6. Constraints 存放约束条件（如时间限制、伤病、禁忌）。
 7. Active Plan Facts 存放当前计划事实（如每周训练频次、计划类型）。
-8. 只输出 JSON，不要有 markdown 代码块标记。
+8. historical_events 提取本轮对话的重要事件摘要：
+   - 每条1-2句话，包含动作→结果的因果链条
+   - source_turns 是这个事件涉及的对话轮次索引（1-based，相对本批次的第几轮）
+   - 如果本轮没有值得记录的事件，返回空数组 []
+   - 适合记录的事件示例：训练反馈、计划调整、饮食偏好变更、伤病症状变化、用户表达新意向
+   - 不适合记录：简单的问候、纯事实查询、无上下文的无意义对话
+9. 只输出 JSON，不要有 markdown 代码块标记。
 """
     return prompt
+
+
+def _write_historical_events(
+    session_id: str,
+    historical_events: list[dict],
+) -> tuple[list[int], list[int]]:
+    """
+    将 historical_events 写入 SQLite + Qdrant。
+
+    Args:
+        session_id: 会话标识
+        historical_events: LLM 产出的历史事件列表
+
+    Returns:
+        (success_event_ids, failed_event_ids)
+    """
+    from Agent.db import (
+        insert_historical_event,
+        prune_old_events,
+        create_sync_job,
+    )
+    from tools.retriever1 import ensure_historical_event_in_qdrant, delete_historical_event_from_qdrant
+
+    success_ids = []
+    failed_ids = []
+
+    for event in historical_events:
+        content = event.get("content", "")
+        source_turns = event.get("source_turns", [])
+        if not content:
+            continue
+
+        # 1. 先写入 SQLite（事实源）
+        try:
+            event_id = insert_historical_event(session_id, content, source_turns)
+        except Exception as e:
+            logger.error(f"[LONG_MEMORY] SQLite insert event failed: {e}")
+            continue
+
+        # 2. 再写入 Qdrant
+        try:
+            ensure_historical_event_in_qdrant(
+                event_id=event_id,
+                session_id=session_id,
+                content=content,
+                source_turns=source_turns,
+            )
+            success_ids.append(event_id)
+        except Exception as e:
+            logger.error(f"[LONG_MEMORY] Qdrant upsert failed for event={event_id}: {e}")
+            # 创建补偿任务
+            try:
+                create_sync_job(event_id, session_id, str(e))
+            except Exception:
+                pass
+            failed_ids.append(event_id)
+
+    # 3. 裁剪：超出 50 条时删除最旧事件
+    try:
+        deleted_ids = prune_old_events(session_id, max_events=50)
+        for did in deleted_ids:
+            try:
+                delete_historical_event_from_qdrant(did)
+            except Exception as e:
+                logger.warning(f"[LONG_MEMORY] Failed to delete Qdrant point for pruned event={did}: {e}")
+    except Exception as e:
+        logger.error(f"[LONG_MEMORY] Prune failed: {e}")
+
+    # 4. 如果有失败的 event，入队补偿重试
+    if failed_ids:
+        from Agent.worker import enqueue_retry_sync_jobs
+        enqueue_retry_sync_jobs()
+
+    return success_ids, failed_ids
 
 
 def update_long_memory(
@@ -496,6 +728,7 @@ def update_long_memory(
         "success": bool,
         "conflicts": list[dict],  # 冲突列表
         "applied_updates": list[str],  # 更新的字段列表
+        "historical_events_count": int,  # 新增历史事件数
         "new_markdown": str,  # 新 markdown 内容（已渲染）
         "conflict_notice": str | None,  # 提示用户的文案
       }
@@ -525,10 +758,16 @@ def update_long_memory(
 
         llm_result = json.loads(raw_output)
         updated_sections = llm_result.get("updated_sections", {})
+        updated_sections = _sanitize_profile_updates(updated_sections)
         applied_updates = []
         for section, fields in updated_sections.items():
             if isinstance(fields, dict):
                 applied_updates.extend([f"{section}.{k}" for k in fields.keys()])
+
+        # 提取 historical_events
+        historical_events = llm_result.get("historical_events", [])
+        if not isinstance(historical_events, list):
+            historical_events = []
 
     except Exception as e:
         logger.error(f"[LONG_MEMORY] LLM update FAILED for session={session_id}: {e}", exc_info=True)
@@ -536,6 +775,7 @@ def update_long_memory(
             "success": False,
             "conflicts": [],
             "applied_updates": [],
+            "historical_events_count": 0,
             "new_markdown": current_md,
             "conflict_notice": None,
         }
@@ -546,6 +786,16 @@ def update_long_memory(
     # 4. 追加冲突日志
     if conflicts:
         append_conflict_log(merged, conflicts)
+        from Agent.db import append_conflict as db_append_conflict
+        #同步写入SQLite
+        for c in conflicts:
+            db_append_conflict(
+                session_id=session_id,
+                field_name=c['field'],
+                old_value=c['old_value'],
+                new_value=c['new_value'],
+                source=c['source']
+            )
 
     # 5. 更新时间戳
     update_last_updated(merged)
@@ -553,7 +803,7 @@ def update_long_memory(
     # 6. 渲染新 Markdown
     new_md = render_markdown(merged)
 
-    # 7. 原子写入
+    # 7. 原子写入 profile
     try:
         save_long_memory(session_id, merged)
     except Exception as e:
@@ -562,11 +812,23 @@ def update_long_memory(
             "success": False,
             "conflicts": conflicts,
             "applied_updates": applied_updates,
+            "historical_events_count": 0,
             "new_markdown": new_md,
             "conflict_notice": None,
         }
 
-    # 8. 生成 conflict_notice
+    # 8. 写入 historical_events
+    successful_events, failed_events = 0, 0
+    if historical_events:
+        success_ids, failed_ids = _write_historical_events(session_id, historical_events)
+        successful_events = len(success_ids)
+        failed_events = len(failed_ids)
+        logger.info(
+            f"[LONG_MEMORY] historical_events: {successful_events} success, {failed_events} failed "
+            f"for session={session_id}"
+        )
+
+    # 9. 生成 conflict_notice
     conflict_notice = None
     if conflicts:
         conflict_notice = "检测到你的偏好发生变化（如训练偏好/约束），我已按你最新信息更新长期记忆。"
@@ -575,6 +837,7 @@ def update_long_memory(
         "success": True,
         "conflicts": conflicts,
         "applied_updates": applied_updates,
+        "historical_events_count": successful_events,
         "new_markdown": new_md,
         "conflict_notice": conflict_notice,
     }

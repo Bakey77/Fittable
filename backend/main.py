@@ -15,14 +15,17 @@ import asyncio
 import re
 import logging
 from typing import Optional, AsyncIterator
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Cookie, Response, HTTPException
+from fastapi import FastAPI, Cookie, Response, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from Agent.cache import get_retrieval_cache, get_food_cache
+
+from Agent.worker import start_worker,stop_worker
 
 from Agent.workflow import run_workflow
 from Agent.memory.session_memory import (
@@ -36,6 +39,7 @@ from Agent.memory.session_memory import (
 )
 
 import threading
+import time
 
 from Agent.memory.metrics import record_redis_op, get_global_stats
 
@@ -58,6 +62,8 @@ _executor = ThreadPoolExecutor(max_workers=Config.THREAD_POOL_MAX_WORKERS,
                                thread_name_prefix="fit_agent_worker",)  # 全局线程池实例
 _task_completed = 0
 _task_lock = threading.Lock()  # 保护 _task_completed 的锁
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +273,10 @@ def resolve_session(
         return session_id, _make_session_cookies(session_id, token)
 
     # 已有会话：检查是否已初始化 token
+    # 旧会话（token 机制引入之前的）自动升级，生成 token 后继续放行
     if not has_session_token(session_id):
-        raise HTTPException(
-            status_code=401,
-            detail="Session expired (no token). Please create a new session.",
-        )
+        token = generate_and_store_session_token(session_id)
+        return session_id, _make_session_cookies(session_id, token)
 
     # 校验 token
     if not cookie_session_token:
@@ -312,6 +317,7 @@ def health():
 async def chat(
     req: ChatRequest,
     response: Response,
+    request: Request,
     session_id: Optional[str] = Cookie(default=None),
     session_token: Optional[str] = Cookie(default=None),
 ):
@@ -324,6 +330,9 @@ async def chat(
     - 返回压缩重试状态（若有）
     """
     sid, cookies = resolve_session(session_id, session_token)
+    # 限流检查（session + IP 双重）
+    if not check_rate_limit(sid, client_ip=request.client.host if request.client else None):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
     _apply_cookies(response, cookies)
 
     loop = asyncio.get_event_loop()
@@ -342,6 +351,7 @@ async def chat(
     # 构建响应
     resp = {
         "session_id": sid,
+        "trace_id": result.get("trace_id"),
         "status": result.get("status"),
         "primary_intent": result.get("primary_intent"),
         "guidance": result.get("guidance"),
@@ -381,6 +391,7 @@ async def chat(
 @app.post("/chat/stream")
 async def chat_stream(
     req: ChatRequest,
+    request: Request,
     session_id: Optional[str] = Cookie(default=None),
     session_token: Optional[str] = Cookie(default=None),
 ):
@@ -393,6 +404,9 @@ async def chat_stream(
     - 以 SSE 形式流式返回 intent 和文本内容
     """
     sid, cookies = resolve_session(session_id, session_token)
+    # 限流检查
+    if not check_rate_limit(sid, client_ip=request.client.host if request.client else None):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
     def run_sync_workflow():
         return run_workflow(req.message, session_id=sid)
@@ -465,8 +479,8 @@ async def chat_stream(
             logger.warning(f"[planning] 二次处理后文本: {text[:100]}")
 
     async def event_stream() -> AsyncIterator[str]:
-        # Stage 1: 立即返回 session_id
-        yield f"data: {json.dumps({'session_id': sid})}\n\n"
+        # Stage 1: 立即返回 session_id + trace_id
+        yield f"data: {json.dumps({'session_id': sid, 'trace_id': result.get('trace_id')})}\n\n"
 
         # Stage 2: 立即返回状态事件
         yield f"data: {json.dumps({'stage': 'processing'})}\n\n"
@@ -600,6 +614,61 @@ def compress_status(
         **status,
     }
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化 Qdrant historical_events collection（幂等）
+    try:
+        from tools.retriever1 import ensure_historical_events_collection
+        ensure_historical_events_collection()
+        logger.info("Historical events Qdrant collection initialized")
+    except Exception as e:
+        logger.warning(f"Failed to init historical_events collection: {e}")
+
+    start_worker()
+    logger.info("Background worker started")
+    yield
+    stop_worker()
+    logger.info("Background worker stopped")
+
+app.router.lifespan_context = lifespan
+
+def check_rate_limit(session_id: str, max_requests: int = 6, window_seconds: int = 60,
+                     client_ip: str | None = None, ip_max_requests: int = 30) -> bool:
+    """
+    滑动窗口限流：session 级 + IP 级兜底。
+    返回 True 放行，False 限流。
+    """
+    from Agent.memory import session_memory
+
+    try:
+        client = session_memory._get_redis_client()
+        now = time.time()
+        window_start = now - window_seconds
+
+        # 1. session 级限流
+        key = f"fit:ratelimit:{session_id}"
+        client.zremrangebyscore(key, 0, window_start)
+        count = client.zcard(key)
+        if count >= max_requests:
+            return False
+        client.zadd(key, {str(now): now})
+        client.expire(key, window_seconds)
+
+        # 2. IP 级兜底（防不带 Cookie 绕过）
+        if client_ip:
+            ip_key = f"fit:ratelimit:ip:{client_ip}"
+            client.zremrangebyscore(ip_key, 0, window_start)
+            ip_count = client.zcard(ip_key)
+            if ip_count >= ip_max_requests:
+                return False
+            client.zadd(ip_key, {str(now): now})
+            client.expire(ip_key, window_seconds)
+
+        return True
+    except Exception as e:
+        logger.warning(f"[RATELIMIT] check failed, fallback to allow: {e}")
+        return True
+
 
 # ---------------------------------------------------------------------------
 # 启动入口
@@ -607,4 +676,5 @@ def compress_status(
 
 if __name__ == "__main__":
     import uvicorn
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     uvicorn.run(app, host="0.0.0.0", port=8000)

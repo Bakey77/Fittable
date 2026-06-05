@@ -11,7 +11,7 @@
 默认运行四种（vector / hybrid / hybrid_rewrite / hybrid_rerank）；hybrid_rewrite_rerank 为可选，需显式传 `--methods hybrid_rewrite_rerank` 或 `all`。
 
 评测指标：Precision@K, Recall@K, F1@K, HitRate@K, MRR@K, nDCG@K
-默认 K 值：3, 5
+默认 K 值：1, 3, 5, 7
 
 用法：
     python scripts/eval_workout_rag.py
@@ -41,7 +41,7 @@ from tools.retriever1 import (
     VectorRetriever,
     BM25Retriever,
     QueryRewriter,
-    LLMReranker,
+    DashScopeReranker,
     reciprocal_rank_fusion,
 )
 
@@ -61,6 +61,16 @@ class VectorOnlyRetriever:
 
     def retrieve(self, query: str, top_k: int = 20) -> list:
         return self._vector_retriever.retrieve(query, top_k)
+
+
+class BM25OnlyRetriever:
+    """只做 BM25 检索，不走向量，不走 Query 改写"""
+
+    def __init__(self, collection_name: str, qdrant_client: QdrantClient):
+        self._bm25_retriever = BM25Retriever(collection_name, qdrant_client)
+
+    def retrieve(self, query: str, top_k: int = 20) -> list:
+        return self._bm25_retriever.retrieve(query, top_k)
 
 
 class HybridNoRewriteRetriever:
@@ -120,7 +130,7 @@ class HybridWithRewriteRetriever:
 
 class HybridWithRerankRetriever:
     """
-    Hybrid Retriever + LLM Rerank（Query Rewrite 关闭，专注验证 Rerank 效果）
+    Hybrid Retriever + DashScope Rerank（Query Rewrite 关闭，专注验证 Rerank 效果）
     """
 
     def __init__(
@@ -136,7 +146,7 @@ class HybridWithRerankRetriever:
         self.collection_name = collection_name
         self.vector_retriever = VectorRetriever(collection_name, qdrant_client, embed_model)
         self.bm25_retriever = BM25Retriever(collection_name, qdrant_client)
-        self.reranker = LLMReranker(rerank_top_n=rerank_top_n)
+        self.reranker = DashScopeReranker(rerank_top_n=rerank_top_n)
         self.vector_top_k = vector_top_k
         self.bm25_top_k = bm25_top_k
         self.fusion_top_k = fusion_top_k
@@ -173,7 +183,7 @@ class HybridWithRewriteAndRerankRetriever:
         self.vector_retriever = VectorRetriever(collection_name, qdrant_client, embed_model)
         self.bm25_retriever = BM25Retriever(collection_name, qdrant_client)
         self.query_rewriter = QueryRewriter()
-        self.reranker = LLMReranker(rerank_top_n=rerank_top_n)
+        self.reranker = DashScopeReranker(rerank_top_n=rerank_top_n)
         self.vector_top_k = vector_top_k
         self.bm25_top_k = bm25_top_k
         self.fusion_top_k = fusion_top_k
@@ -513,9 +523,9 @@ def main():
     parser = argparse.ArgumentParser(description="训练指导 RAG 检索评测（四种方案对比）")
     parser.add_argument("--gold", default="scripts/eval_workout_gold.json")
     parser.add_argument("--output", default="scripts/eval_results")
-    parser.add_argument("--k", nargs="+", type=int, default=[3, 5])
+    parser.add_argument("--k", nargs="+", type=int, default=[1, 3, 5, 7])
     parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--fusion-k", type=int, default=5)
+    parser.add_argument("--fusion-k", type=int, default=7)
     parser.add_argument("--rerank-top-n", type=int, default=20,
                         help="Hybrid 召回候选数量，送入 Rerank（仅 Hybrid+Rerank）")
     parser.add_argument("--debug", action="store_true")
@@ -523,18 +533,19 @@ def main():
         "--methods",
         nargs="+",
         default=["vector", "hybrid", "hybrid_rewrite", "hybrid_rerank"],
-        choices=["vector", "hybrid", "hybrid_rewrite", "hybrid_rerank", "hybrid_rewrite_rerank", "all"],
+        choices=["vector", "bm25", "hybrid", "hybrid_rewrite", "hybrid_rerank", "hybrid_rewrite_rerank", "all"],
         help="指定运行哪些方法（默认四种；hybrid_rewrite_rerank 为可选，需显式指定）",
     )
     args = parser.parse_args()
 
     if "all" in args.methods:
-        active_methods = ["vector", "hybrid", "hybrid_rewrite", "hybrid_rerank", "hybrid_rewrite_rerank"]
+        active_methods = ["vector", "bm25", "hybrid", "hybrid_rewrite", "hybrid_rerank", "hybrid_rewrite_rerank"]
     else:
         active_methods = args.methods
 
     method_display_names = {
         "vector": "Vector Only",
+        "bm25": "BM25 Only",
         "hybrid": "Hybrid（无Rewrite无Rerank）",
         "hybrid_rewrite": "Hybrid+Rewrite",
         "hybrid_rerank": "Hybrid+Rerank",
@@ -554,6 +565,8 @@ def main():
     retrievers = {}
     if "vector" in active_methods:
         retrievers["vector"] = VectorOnlyRetriever(collection, qdrant_client, embed_model)
+    if "bm25" in active_methods:
+        retrievers["bm25"] = BM25OnlyRetriever(collection, qdrant_client)
     if "hybrid" in active_methods:
         retrievers["hybrid"] = HybridNoRewriteRetriever(
             collection, qdrant_client, embed_model,
@@ -596,6 +609,16 @@ def main():
             results_by_method["vector"].append(result)
             if args.debug:
                 print(f"\n[DEBUG] [{qid}] Vector Only | gold={gold_titles} | ret={result.retrieved_titles}")
+
+        # BM25 Only
+        if "bm25" in active_methods:
+            t0 = time.time()
+            chunks = retrievers["bm25"].retrieve(query, top_k=args.fusion_k)
+            elapsed_by_method["bm25"] = elapsed_by_method.get("bm25", 0) + (time.time() - t0)
+            result = evaluate_query(qid, query, chunks, gold_titles, args.k)
+            results_by_method["bm25"].append(result)
+            if args.debug:
+                print(f"\n[DEBUG] [{qid}] BM25 Only | gold={gold_titles} | ret={result.retrieved_titles}")
 
         # Hybrid
         if "hybrid" in active_methods:
@@ -644,28 +667,49 @@ def main():
     # 聚合
     agg_by_method = {m: aggregate_metrics(results_by_method[m], args.k) for m in active_methods}
 
-    # 打印摘要（动态 N 列）
+    # 打印摘要（动态列宽）
     n = len(active_methods)
-    print("\n" + "=" * (30 + 26 * n))
-    print("评测结果摘要")
-    print("=" * (30 + 26 * n))
+    label_row = " / ".join(method_display_names[m] for m in active_methods)
 
-    header_row = "Metric".ljust(14) + "".join(
-        f"  K={k} " + " / ".join(method_display_names[m] for m in active_methods) for k in args.k
-    ) + "  MRR  " + " / ".join(method_display_names[m] for m in active_methods)
-    print(header_row)
-    print("-" * (30 + 26 * n))
+    # 计算每列最大宽度
+    metric_width = max(len(m) for m in ["Precision@K", "Recall@K", "F1@K", "HitRate@K", "nDCG@K"]) + 2
+    k_headers = [f"K={k}" for k in args.k]
+    mrr_header = "MRR"
+    metric_keys = ["Precision@K", "Recall@K", "F1@K", "HitRate@K", "nDCG@K"]
+    k_col_widths = []
+    for k in args.k:
+        max_data = 0
+        for mk in metric_keys:
+            cell_str = " / ".join(f"{agg_by_method[m][k][mk]:.4f}" for m in active_methods)
+            max_data = max(max_data, len(cell_str))
+        k_col_widths.append(max(len(k_headers[args.k.index(k)]), max_data))
+    mrr_data = [f"{agg_by_method[m]['MRR']:.4f}" for m in active_methods]
+    mrr_str = " / ".join(mrr_data)
+    mrr_width = max(len(mrr_header), len(mrr_str))
+
+    separator = "=" * (metric_width + sum(k_col_widths) + mrr_width + 3 * (len(args.k) + 1))
+    print("\n" + separator)
+    print("评测结果摘要")
+    print(separator)
+
+    # 表头
+    header = "Metric".ljust(metric_width)
+    for i, kh in enumerate(k_headers):
+        header += kh.center(k_col_widths[i]) + "  "
+    header += mrr_header.center(mrr_width)
+    print(header)
+    print("-" * (metric_width + sum(k_col_widths) + mrr_width + 3 * (len(args.k) + 1)))
 
     for metric_key in ["Precision@K", "Recall@K", "F1@K", "HitRate@K", "nDCG@K"]:
-        row = metric_key.ljust(14)
-        for k in args.k:
+        row = metric_key.ljust(metric_width)
+        for i, k in enumerate(args.k):
             cells = [f"{agg_by_method[m][k][metric_key]:.4f}" for m in active_methods]
-            row += "  " + " / ".join(cells).ljust(26)
+            row += (" / ".join(cells)).center(k_col_widths[i]) + "  "
         mrr_cells = [f"{agg_by_method[m]['MRR']:.4f}" for m in active_methods]
-        row += "  " + " / ".join(mrr_cells)
+        row += (" / ".join(mrr_cells)).center(mrr_width)
         print(row)
 
-    print("-" * (30 + 26 * n))
+    print("-" * (metric_width + sum(k_col_widths) + mrr_width + 3 * (len(args.k) + 1)))
     print("耗时:")
     for method, elapsed in elapsed_by_method.items():
         print(f"  {method_display_names[method]}: {elapsed:.2f}s")

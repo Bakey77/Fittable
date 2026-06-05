@@ -723,6 +723,7 @@
         let isLoading = false;
         let turnCount = 0;
         let currentIntent = null;
+        let shouldAutoScroll = true;
 
         const isLocalBackendOrigin =
             (window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost") &&
@@ -777,6 +778,45 @@
             if (meta.target)  document.getElementById("goalTarget").textContent = meta.target;
             if (meta.freq)    document.getElementById("goalFrequency").textContent = meta.freq;
             if (meta.days)    document.getElementById("goalDays").textContent = meta.days;
+        }
+
+        function appendSecondarySummary(intent, text) {
+            if (!text) return;
+            const box = document.getElementById("chatBox");
+            const secDiv = document.createElement("div");
+            secDiv.className = "msg ai";
+
+            const secIntent = document.createElement("span");
+            secIntent.className = "intent-tag";
+            secIntent.textContent = `[${intent || "secondary"}]`;
+
+            const secBubble = document.createElement("span");
+            secBubble.className = "bubble";
+            secBubble.textContent = `补充信息：${text}`;
+
+            const secMeta = document.createElement("div");
+            secMeta.className = "ai-meta";
+            secMeta.textContent = "补充";
+
+            secDiv.appendChild(secIntent);
+            secDiv.appendChild(secBubble);
+            secDiv.appendChild(secMeta);
+            box.appendChild(secDiv);
+            scrollToBottom();
+        }
+
+        function isNearBottom(el, threshold = 80) {
+            return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
+        }
+
+        function scrollToBottom(force = false) {
+            const box = document.getElementById("chatBox");
+            if (!box) return;
+            if (force || shouldAutoScroll) {
+                requestAnimationFrame(() => {
+                    box.scrollTop = box.scrollHeight;
+                });
+            }
         }
 
         function resetGoalCard() {
@@ -838,6 +878,7 @@
             userDiv.className = "msg user";
             userDiv.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
             box.appendChild(userDiv);
+            scrollToBottom(true);
 
             /* ---- AI 消息占位 ---- */
             const aiDiv = document.createElement("div");
@@ -857,6 +898,7 @@
             aiDiv.appendChild(textSpan);
             aiDiv.appendChild(metaDiv);
             box.appendChild(aiDiv);
+            scrollToBottom(true);
 
             /* ---- 流式读取 ---- */
             let fullText = "";
@@ -900,6 +942,10 @@
                             try {
                                 const obj = JSON.parse(data);
                                 if (typeof obj === "object" && obj !== null && !Array.isArray(obj)) {
+                                    if (obj.type === "secondary_summary") {
+                                        appendSecondarySummary(obj.intent, obj.text);
+                                        continue;
+                                    }
                                     /* session_id */
                                     if (obj.session_id) {
                                         document.getElementById("sessionInput").value = obj.session_id;
@@ -925,6 +971,7 @@
                                         textSpan.textContent = fullText;
                                         metaDiv.innerHTML = "";
                                         metaDiv.className = "ai-meta";
+                                        scrollToBottom();
                                         /* 训练计划：从流式文本中实时解析目标卡数据 */
                                         if (currentIntent === "training_plan") {
                                             const meta = parsePlanMeta(fullText);
@@ -957,7 +1004,7 @@
             } finally {
                 isLoading = false;
                 document.getElementById("sendBtn").disabled = false;
-                box.scrollTop = box.scrollHeight;
+                scrollToBottom(true);
             }
         }
 
@@ -1006,6 +1053,14 @@
                 setError("清空失败: " + err.message);
             }
         }
+
+        (function bindChatScroll() {
+            const box = document.getElementById("chatBox");
+            if (!box) return;
+            box.addEventListener("scroll", () => {
+                shouldAutoScroll = isNearBottom(box);
+            }, { passive: true });
+        })();
     </script>
 </body>
 </html>

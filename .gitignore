@@ -9,3 +9,23 @@ __pycache__/
 hld/
 comment/
 Agent/修改执行文档.md
+
+# Logs
+*.log
+
+# SQLite runtime files
+*.db-shm
+*.db-wal
+
+# Vector DB storage
+qdrant_storage/
+
+# Demo scripts with hardcoded credentials
+scripts/llm_demo.py
+hello-agent/
+
+# Evaluation artifacts
+eval.rag
+
+# Misc
+理解文件/

@@ -4,6 +4,7 @@
 支持多意图独立评分、排序和筛选
 """
 import sys
+import logging
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from backend.services.llm import get_longcat_llm
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -339,12 +342,17 @@ class IntentClassifier:
         self.prompt_template = prompt_file.read_text(encoding="utf-8")
         self.llm = llm or get_longcat_llm()
 
-    def classify(self, user_input: str) -> dict[str, Any]:
+    def classify(self, user_input: str, route_context: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         对用户输入进行意图分类
 
         Args:
             user_input: 用户原始输入文本
+            route_context: 可选路由上下文 {
+                "previous_intent": str|None,
+                "recent_summary": str,
+                "relevant_events": list[dict],
+            }
 
         Returns:
             {
@@ -355,8 +363,34 @@ class IntentClassifier:
         """
         # 1. 调用 LLM 获取候选意图列表
         prompt = self.prompt_template.replace("{user_input}", user_input.strip())
-        response = self.llm.invoke([{"role": "user", "content": prompt}])
-        raw = response.content if hasattr(response, "content") else str(response)
+
+        # 注入路由上下文（如有）
+        if route_context:
+            rc_parts = []
+            prev = route_context.get("previous_intent")
+            if prev:
+                rc_parts.append(f"上一轮意图: {prev}")
+            recent = route_context.get("recent_summary")
+            if recent:
+                rc_parts.append(f"最近对话摘要:\n{recent}")
+            events = route_context.get("relevant_events", [])
+            if events:
+                ev_lines = [f"- {e.get('content', '')}" for e in events if e.get("content")]
+                if ev_lines:
+                    rc_parts.append("相关历史事件:\n" + "\n".join(ev_lines))
+            if rc_parts:
+                prompt = prompt + "\n\n【路由上下文】\n" + "\n".join(rc_parts)
+        try:
+            response = self.llm.invoke([{"role": "user", "content": prompt}])
+            raw = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.warning(f"LLM call failed in intent classifier: {e}, falling back to general")
+            return {
+                "intents": [{"type": "general", "llm_confidence": 0.5, "keyword_score": 0.0}],
+                "primary_intent": {"type": "general", "confidence": 0.5},
+                "secondary_intent": None,
+                "entities": {},
+            }
         parsed = parse_json_from_text(raw)
 
         # 2. 提取 llm_intents（支持两种格式回退）
@@ -437,6 +471,15 @@ class IntentClassifier:
             ]
             result["secondary_intent"] = None
 
+        # NOTE: confidence 仅用于观测日志，不用于兜底回退决策
+        if scored_intents:
+            top = scored_intents[0]
+            logger.info(
+                f"[CLASSIFY] primary={top['type']} confidence={top['confidence']:.3f} "
+                f"(llm={top['llm_confidence']:.3f} kw={top['keyword_score']:.3f} "
+                f"ent={top['entity_score']:.3f})"
+            )
+
         return result
 
 
@@ -446,14 +489,14 @@ class IntentClassifier:
 _classifier: IntentClassifier | None = None
 
 
-def classify_intent(user_input: str) -> dict[str, Any]:
+def classify_intent(user_input: str, route_context: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     便捷函数：对用户输入进行意图分类
     """
     global _classifier
     if _classifier is None:
         _classifier = IntentClassifier()
-    return _classifier.classify(user_input)
+    return _classifier.classify(user_input, route_context=route_context)
 
 
 # =============================================================================

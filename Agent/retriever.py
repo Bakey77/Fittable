@@ -318,7 +318,7 @@ class FitnessGuideRetrieverImpl:
         if use_cache:
             from Agent.cache import get_retrieval_cache
             cache = get_retrieval_cache()
-            cached = cache.get(query)
+            cached = cache.get(query,use_lock=True)
             if cached is not None:
                 return cached
             
@@ -342,6 +342,7 @@ class FitnessGuideRetrieverImpl:
         #写缓存
         if use_cache:
             cache.set(query,result,is_empty=(len(result)==0))
+            cache.release_after_backfill(query)
         return result
                 
 

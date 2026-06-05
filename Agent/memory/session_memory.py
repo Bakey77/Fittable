@@ -151,6 +151,8 @@ if operation == "increment_total_turns" then
 elseif operation == "mark_batch_processed" then
     local total_turns = memory.metadata.total_turns or 0
     memory.metadata.long_memory_batch_processed = math.floor(total_turns / batch_size)
+elseif operation == "set_last_intent" then
+    memory.metadata.last_intent = ARGV[4]
 end
 
 redis.call('SETEX', key, ttl, cjson.encode(memory))
@@ -536,12 +538,13 @@ def trim_and_summarize(session_id: str, max_turns: int = 10) -> None:
     record_redis_op(session_id, "trim", elapsed, client)
 
 
-def update_metadata(session_id: str, operation: str, batch_size: int = 10) -> None:
+def update_metadata(session_id: str, operation: str, batch_size: int = 10, intent_value: str = "") -> None:
     """原子更新 metadata 字段。
 
     operation:
     - "increment_total_turns": metadata.total_turns += 1
     - "mark_batch_processed": metadata.long_memory_batch_processed = total_turns // batch_size
+    - "set_last_intent": metadata.last_intent = intent_value
     """
     client = _get_redis_client()
     start = time.monotonic()
@@ -559,15 +562,17 @@ def update_metadata(session_id: str, operation: str, batch_size: int = 10) -> No
             elif operation == "mark_batch_processed":
                 total_turns = memory["metadata"].get("total_turns", 0)
                 memory["metadata"]["long_memory_batch_processed"] = total_turns // batch_size
+            elif operation == "set_last_intent":
+                memory["metadata"]["last_intent"] = intent_value
         elapsed = (time.monotonic() - start) * 1000
         record_redis_op(session_id, "update_metadata_fallback", elapsed)
         return
 
     sha = _registered_scripts.get("update_metadata")
     if sha:
-        client.evalsha(sha, 1, _key(session_id), operation, _SESSION_TTL, batch_size)
+        client.evalsha(sha, 1, _key(session_id), operation, _SESSION_TTL, batch_size, intent_value)
     else:
-        client.eval(_LUA_UPDATE_METADATA, 1, _key(session_id), operation, _SESSION_TTL, batch_size)
+        client.eval(_LUA_UPDATE_METADATA, 1, _key(session_id), operation, _SESSION_TTL, batch_size, intent_value)
     elapsed = (time.monotonic() - start) * 1000
     record_redis_op(session_id, "update_metadata", elapsed, client)
 

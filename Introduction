@@ -5,8 +5,8 @@ open /Users/liaomeiqi/Downloads/Fit-Agent/front/index.html
 python scripts/eval_workout_rag.py --fusion-k 10 --k 3 5 10
 
 python scripts/eval_workout_rag.py --methods vector --debug  纯向量检索
-python scripts/eval_workout_rag.py --methods hybrid --debug  混合检索（BM25 + 向量）
-python scripts/eval_workout_rag.py --methods hybrid_rewrite --debug 只跑rewrite
+python scripts/eval_workout_rag.py --methods hybrid --debug  混合检索（BM25 + 向量）（RRF融合，无rewrite和rerank）
+python scripts/eval_workout_rag.py --methods hybrid_rewrite --debug 只跑rewrite+RRF融合
 python scripts/eval_workout_rag.py --methods hybrid_rewrite_rerank --debug 混合检索（BM25 + 向量 + rewrite + rerank）
 
 python3 -m venv vibe
@@ -19,7 +19,32 @@ curl -N -X POST http://localhost:8000/chat/stream \
 
 `git add -A && git commit -m "阶段1.1: 添加Redis连接池"`
 
+docker run -d -p 6333:6333 -v $(pwd)/qdrant_storage:/qdrant/storage qdrant/qdrant 启动容器
 python uploads/build_index.py  构建向量索引
+
+
 
 curl http://localhost:8000/health | python -m json.tool  #格式优化
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "深蹲怎么做"}' | python -m json.tool
+
+Precison = 命中数/返回数 代表用户体验（低表示给了一堆不相关的答案）有没有找准（给用户看的几条里面，正经有用的占几条）
+Recall = 命中数/标准答案总数 低了表示答案不完整。有没有找全
+F1 = 2（Precision * Recall）/（Precision + Recall）
+MRR：第一个有用的排在第几位
+HitRate@K：top-K 里至少命中 1 个的比例
+nDCG@K：把排名位置也考虑进去的综合排序质量分。核心逻辑：好结果排得越靠前，分数越高。
+
+redis-cli ping 判断redis是不是连通
+redis=server 是启动redis
+
+# 查看所有 session 的用户档案
+  sqlite3 Agent/data/fit_agent.db "SELECT * FROM user_profile;"
+
+  # 查看用户属性（偏好/约束/计划）
+  sqlite3 Agent/data/fit_agent.db "SELECT * FROM user_attributes;"
+
+  # 查看冲突日志
+  sqlite3 Agent/data/fit_agent.db "SELECT * FROM conflict_log;"
+
+  # 查看某个 session 的历史事件
+  sqlite3 Agent/data/fit_agent.db "SELECT * FROM historical_events WHERE session_id='你的session_id';"
